@@ -1,0 +1,42 @@
+# uw3-hpc: Codex requirements for the hpc read-only mode (serve-codex).
+# doctor-codex fills in @HOME@; serve-codex and doctor-codex refuse unless /etc/codex/requirements.toml is exactly this.
+allowed_sandbox_modes = ["read-only", "workspace-write"]
+allowed_approval_policies = ["on-request", "never"]
+allowed_approvals_reviewers = ["user"]
+allow_managed_hooks_only = true
+
+[features]
+plugins = false
+
+[mcp_servers.hpc.identity]
+command = { executable = "/usr/bin/env", args = [
+    { match = "exact", value = "-i" },
+    { match = "exact", value = "/usr/bin/python3" },
+    { match = "exact", value = "-I" },
+    { match = "exact", value = "@HOME@/.local/share/uw3-hpc/hpc_mcp.py" },
+    { match = "exact", value = "serve-codex" },
+] }
+
+[permissions.filesystem]
+deny_read = ["@HOME@/.ssh"]
+
+[rules]
+prefix_rules = [
+    { pattern = [{ any_of = ["ssh", "scp", "sftp", "rsync"] }], canonical_matching = true, decision = "forbidden", justification = "Reach the clusters only through the hpc MCP tools" },
+]
+
+[experimental_network]
+enabled = true
+dangerously_allow_all_unix_sockets = false
+
+[experimental_network.domains]
+"gadi.nci.org.au" = "deny"
+"gadi-dm.nci.org.au" = "deny"
+"setonix.pawsey.org.au" = "deny"
+"data-mover.pawsey.org.au" = "deny"
+"kaiju.anu.edu.au" = "deny"
+"*.nci.org.au" = "deny"
+"*.pawsey.org.au" = "deny"
+"150.203.8.145" = "deny"
+
+[experimental_network.unix_sockets]

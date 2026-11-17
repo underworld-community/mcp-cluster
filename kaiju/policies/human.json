@@ -1,0 +1,106 @@
+{
+  "env": {
+    "DISABLE_UPDATES": "1",
+    "DISABLE_FEEDBACK_COMMAND": "1"
+  },
+  "allowManagedHooksOnly": true,
+  "permissions": {
+    "defaultMode": "default",
+    "disableBypassPermissionsMode": "disable",
+    "allow": [
+      "Bash(squeue *)",
+      "Bash(sinfo *)",
+      "Bash(scontrol show *)",
+      "Bash(sbatch *)",
+      "Bash(srun *)",
+      "Bash(apptainer *)"
+    ],
+    "ask": [
+      "Bash(scancel *)"
+    ],
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.netrc)",
+      "Read(~/.git-credentials)",
+      "Read(~/.pypirc)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.docker/**)",
+      "Read(~/.apptainer/**)",
+      "Edit(~/.ssh/**)",
+      "Edit(~/.gnupg/**)",
+      "Edit(~/.bashrc)",
+      "Edit(~/.bash_profile)",
+      "Edit(~/.bash_login)",
+      "Edit(~/.bash_logout)",
+      "Edit(~/.bash_aliases)",
+      "Edit(~/.bashrc.d/**)",
+      "Edit(~/.profile)",
+      "Edit(~/.zshrc)",
+      "Edit(~/.zprofile)",
+      "Edit(~/.zshenv)",
+      "Edit(~/.local/bin/**)",
+      "Edit(~/.local/lib/**)",
+      "Edit(~/bin/**)",
+      "Edit(~/.gitconfig)",
+      "Edit(~/.config/git/**)",
+      "Edit(~/.config/systemd/**)",
+      "Edit(~/.tmux.conf)",
+      "Edit(~/.modulerc)",
+      "Edit(~/.claude/settings.json)",
+      "Edit(//opt/cluster/**)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "excludedCommands": [
+      "squeue *",
+      "sinfo *",
+      "scontrol show *",
+      "sbatch *",
+      "scancel *",
+      "srun *",
+      "apptainer *"
+    ],
+    "filesystem": {
+      "denyRead": [
+        "~/.ssh",
+        "~/.gnupg",
+        "~/.aws",
+        "~/.netrc",
+        "~/.git-credentials",
+        "~/.pypirc",
+        "~/.config/gh",
+        "~/.docker",
+        "~/.apptainer"
+      ],
+      "denyWrite": [
+        "~/.ssh",
+        "~/.gnupg",
+        "~/.bashrc",
+        "~/.bash_profile",
+        "~/.bash_login",
+        "~/.bash_logout",
+        "~/.bash_aliases",
+        "~/.bashrc.d",
+        "~/.profile",
+        "~/.zshrc",
+        "~/.zprofile",
+        "~/.zshenv",
+        "~/.local/bin",
+        "~/.local/lib",
+        "~/bin",
+        "~/.gitconfig",
+        "~/.config/git",
+        "~/.config/systemd",
+        "~/.tmux.conf",
+        "~/.modulerc",
+        "~/.claude/settings.json",
+        "/opt/cluster"
+      ]
+    }
+  }
+}

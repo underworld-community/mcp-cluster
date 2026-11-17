@@ -1,0 +1,948 @@
+#!/bin/bash
+#
+# Claude agent accounts on Kaiju: <member>-agent, uid = gid in 7000-7999.
+#
+#   ./kaiju-agent precheck                       # read-only; decides ROUTE=nis|local
+#   ./kaiju-agent baseline [--route R] [--dry-run]
+#   ./kaiju-agent create <member> --pubkey FILE [--uid N] [--cpu 800%] [--mem 32G]
+#                        [--tasks 4096] [--route nis|local] [--dry-run]
+#   ./kaiju-agent suspend <agent> [--dry-run]    # the off switch
+#   ./kaiju-agent resume <agent> [--dry-run]
+#   ./kaiju-agent audit [agent]                  # read-only; non-zero on any violation
+#   ./kaiju-agent list
+#
+# Run as your -adm account on the login node from a fresh ssh; root steps use sudo. baseline
+# and create are safe to rerun: each step checks the current state first.
+#
+# A node that is down stops baseline and create. To go ahead without it, name it in
+# SKIP_NODES (e.g. SKIP_NODES="n5" ./kaiju-agent create jdoe ...): the node is drained
+# and the follow-up commands are printed.
+#
+# Nothing in an agent home is run or followed as root. Root-owned items are made by a
+# script that refuses symlinks; agent-owned items are made as the agent via sudo -u.
+
+set -euo pipefail
+
+# Tests only: a fake root prefix for /etc, /home, /var and /tmp. Empty on Kaiju.
+R=${KAIJU_AGENT_ROOT:-}
+
+NODES=(n1 n2 n3 n4 n5 n6 n7 n8)
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
+LOGIN_IP=150.203.8.145
+# The login node's other networks (to the nodes, InfiniBand, libvirt), read from its connected routes so
+# no private address is written here. Sorted, so the key line and DenyUsers come out the same each run.
+INTERNAL_NETS=$(ip -4 route show proto kernel scope link | awk -v ip="$LOGIN_IP" '
+    {s = ""; for (i = 1; i < NF; i++) if ($i == "src") s = $(i + 1)} s != ip {print $1}' | sort -V | xargs)
+[ -n "$INTERNAL_NETS" ] || { echo "kaiju-agent: no internal networks in 'ip -4 route'; run it on the login node" >&2; exit 1; }
+AGENT_GROUP=kaiju-agents
+AGENT_GID=7000
+FIRST_UID=7001
+LAST_UID=7999
+
+STATE=$R/etc/kaiju-agents
+REG=$STATE/registry.tsv
+KEYDIR=$R/etc/ssh/authorized_keys
+SSHD_CONFIG=$R/etc/ssh/sshd_config
+HOMES=$R/home
+SHARE=$HOMES/agent-share
+UNITS=$R/etc/systemd/system
+TS=$(date +%Y%m%d-%H%M%S)
+
+# Patterns, not a list of agents, so a new agent needs no edit on any node.
+# Any address on this host (a client can bind one as its source) or inside the cluster: 127/8, not only 127.0.0.1.
+LOCAL_NETS="127.0.0.0/8 ::1 fe80::/10 $LOGIN_IP $INTERNAL_NETS"
+LOGIN_DENY=$(printf '*-agent@%s ' $LOCAL_NETS); LOGIN_DENY=${LOGIN_DENY% }
+KEY_FROM=$(printf '!%s,' $LOCAL_NETS)*
+
+# Appended at the very end: a Match block runs to the end of the file, and an earlier
+# Match that also matches would win. Each forwarding is named, not DisableForwarding, so sshd -T shows it.
+MATCH_BLOCK='# BEGIN kaiju-agents v1 (managed by kaiju-agent)
+Match User *-agent
+    AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+    AuthorizedKeysCommand none
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    GSSAPIAuthentication no
+    HostbasedAuthentication no
+    PermitTTY yes
+    AllowAgentForwarding no
+    AllowTcpForwarding no
+    AllowStreamLocalForwarding no
+    X11Forwarding no
+    PermitTunnel no
+    PermitUserRC no
+    GatewayPorts no
+    ClientAliveInterval 300
+# END kaiju-agents'
+
+POLKIT_RULE='// Managed by kaiju-agent: a lingering user manager would run agent units with no session.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.set-self-linger" ||
+         action.id == "org.freedesktop.login1.set-user-linger") &&
+        /-agent$/.test(subject.user)) {
+        return polkit.Result.NO;
+    }
+});'
+
+DRY=0 PUBKEY= UID_OPT= ROUTE_OPT= CPU=800% MEM=32G TASKS=4096
+
+# Staged on local /tmp, not in the repo: under a root-squashed /home root cannot read
+# the admin's files, so everything sudo copies comes from here.
+STAGE=$(mktemp -d "$R/tmp/kaiju-agent.XXXXXX")
+trap 'rm -rf "$STAGE"' EXIT
+
+die()  { echo "kaiju-agent: $*" >&2; exit 1; }
+warn() { echo "WARNING:    $*" >&2; }
+run()  { if [ "$DRY" = 1 ]; then printf '+'; printf ' %q' "$@"; printf '\n'; else "$@"; fi; }
+log()  { [ "$DRY" = 1 ] || logger -t kaiju-agent -- "$(id -un): $*" || true; }
+
+# ssh reads stdin, so every call except the sshd edit gets /dev/null.
+on() { sudo ssh "${SSH_OPTS[@]}" "$1" "$2" </dev/null; }
+
+# A script for root on one host: the login node ("login") or a compute node.
+run_sh() {
+    local host=$1 script=$2
+    if [ "$DRY" = 1 ]; then
+        echo "+ [$host] as root:"; printf '%s\n' "$script" | sed 's/^/    /'
+    elif [ "$host" = login ]; then
+        (cd / && sudo bash -c "$script" </dev/null)
+    else
+        on "$host" "$script"
+    fi
+}
+
+# The same root script on every up node; --dry-run shows it once.
+run_sh_nodes() {
+    local n
+    if [ "$DRY" = 1 ]; then
+        [ ${#UP[@]} -eq 0 ] || run_sh "${UP[*]}" "$1"
+    else
+        for n in "${UP[@]}"; do run_sh "$n" "$1"; done
+    fi
+}
+
+# cwd / and no stdin: nothing the agent controls is read as input, and a tool started
+# here cannot reach the admin's terminal.
+as_user() { local u=$1; shift; (cd / && sudo -u "$u" setsid -w "$@" </dev/null); }
+
+# Hidden name, then rename, as in kaiju_claude_install.sh. An existing file that changes
+# is backed up first unless the 4th argument is "nobak".
+put_root_file() {
+    local src=$1 dst=$2 mode=$3 tmp
+    tmp="$(dirname "$dst")/.$(basename "$dst").new"
+    if sudo cmp -s "$src" "$dst" 2>/dev/null; then
+        echo "unchanged:  $dst"; return
+    fi
+    if [ "$DRY" = 1 ]; then
+        echo "+ write $dst (root:root $mode):"; sed 's/^/    | /' "$src"; return
+    fi
+    if [ "${4:-}" != nobak ] && sudo test -e "$dst"; then
+        sudo cp -p "$dst" "$dst.bak-$TS"
+    fi
+    sudo install -m "$mode" -o root -g root "$src" "$tmp"
+    sudo mv -f "$tmp" "$dst"
+    echo "wrote:      $dst"
+}
+
+add_line() {
+    local f=$1 line=$2 s mode=0600
+    s="$STAGE/$(basename "$f")"
+    if sudo test -e "$f"; then
+        sudo cat "$f" > "$s"
+        mode=$(sudo stat -c %a "$f")
+    else
+        : > "$s"
+    fi
+    if grep -qxF -- "$line" "$s"; then echo "present:    $line in $f"; return; fi
+    printf '%s\n' "$line" >> "$s"
+    put_root_file "$s" "$f" "$mode"
+}
+
+restorecon_if() { if command -v restorecon >/dev/null; then run sudo restorecon -R "$@"; fi; }
+
+reg_get() { awk -F'\t' -v a="$1" -v c="$2" '!/^#/ && $1==a {print $c}' "$REG" 2>/dev/null || true; }
+
+reg_set() {   # agent uid member status created expires keyfp
+    local row s=$STAGE/registry.tsv
+    row=$(printf '%s\t' "$@"); row=${row%$'\t'}
+    { if [ -f "$REG" ]; then cat "$REG"; else printf '# agent\tuid\tmember\tstatus\tcreated\texpires\tkeyfp\n'; fi; } \
+        | awk -F'\t' -v a="$1" -v row="$row" '$1==a {print row; f=1; next} {print} END {if (!f) print row}' > "$s"
+    put_root_file "$s" "$REG" 0644
+}
+
+reg_status() {
+    local a=$1 st=$2
+    reg_set "$a" "$(reg_get "$a" 2)" "$(reg_get "$a" 3)" "$st" "$(reg_get "$a" 5)" "$(reg_get "$a" 6)" "$(reg_get "$a" 7)"
+}
+
+UP=() SKIPPED=() DOWN=()
+probe_nodes() {
+    local n
+    UP=() SKIPPED=() DOWN=()
+    for n in "${NODES[@]}"; do
+        if [[ " ${SKIP_NODES:-} " == *" $n "* ]]; then SKIPPED+=("$n")
+        elif on "$n" true >/dev/null 2>&1; then UP+=("$n")
+        else DOWN+=("$n")
+        fi
+    done
+}
+
+need_nodes() {
+    probe_nodes
+    [ ${#DOWN[@]} -eq 0 ] || die "cannot reach ${DOWN[*]} — nothing changed. To go ahead without them:
+            SKIP_NODES=\"${SKIP_NODES:+$SKIP_NODES }${DOWN[*]}\" $0 $MODE ..."
+    [ ${#SKIPPED[@]} -eq 0 ] || echo "skipping:   ${SKIPPED[*]} (SKIP_NODES)"
+}
+
+drain_skipped() {
+    local n
+    for n in "${SKIPPED[@]}"; do
+        run sudo scontrol update nodename="$n" state=drain reason="kaiju-agent: $1"
+    done
+}
+
+# Humans resolve from local files on the nodes (route local) or only via NIS (route nis).
+detect_route() {
+    local h n=${UP[0]:-}
+    [[ " ${UP[*]} " == *" n1 "* ]] && n=n1
+    h=$(getent group wheel | cut -d: -f4 | tr , '\n' | grep -v -e '-adm$' -e '-agent$' -e '^root$' | head -n1 || true)
+    if [ -z "$n" ] || [ -z "$h" ]; then echo unknown; return; fi
+    if on "$n" "getent -s files passwd $h" >/dev/null 2>&1; then echo local
+    elif on "$n" "getent -s nis passwd $h" >/dev/null 2>&1; then echo nis
+    else echo unknown
+    fi
+}
+
+choose_route() {
+    local r=${ROUTE_OPT:-}
+    [ -n "$r" ] || r=$(cat "$STATE/route" 2>/dev/null || true)
+    [ -n "$r" ] || r=$(detect_route)
+    case $r in nis|local) echo "$r" ;; *) die "cannot tell the account route; run precheck, then pass --route nis|local" ;; esac
+}
+
+nis_publish() {
+    echo "NIS:        what rebuilding /var/yp would publish now (every pending /etc change, not only ours):"
+    sudo make -n -C /var/yp 2>&1 | grep -i updating | sed 's/^/    /' || echo "    (nothing listed)"
+    if [ "$DRY" = 1 ]; then run sudo make -C /var/yp; return; fi
+    local a
+    read -r -p "Publish these maps now? [y/N] " a || a=
+    [ "$a" = y ] || die "NIS not rebuilt; rerun when ready (safe to rerun)"
+    sudo make -C /var/yp
+    local n
+    for n in "${UP[@]}"; do
+        on "$n" 'if systemctl -q is-active nscd; then nscd -i passwd; nscd -i group; fi' || true
+    done
+}
+
+nodes_resolve() {   # db name id: true when every up node already has it (an NIS rebuild has run)
+    local n
+    for n in "${UP[@]}"; do
+        [ "$(on "$n" "getent $1 $2 | cut -d: -f3" 2>/dev/null || true)" = "$3" ] || return 1
+    done
+}
+
+ensure_group_cmd() {   # name gid -> root snippet that creates or checks the group
+    cat <<EOF
+c=\$(getent group $1 | cut -d: -f3)
+if [ -z "\$c" ]; then groupadd -g $2 $1
+elif [ "\$c" != $2 ]; then echo "\$(hostname -s): group $1 has gid \$c, expected $2" >&2; exit 1
+fi
+EOF
+}
+
+# The same script edits the login node and the compute nodes. It changes nothing when
+# the file is already right, prints a diff on --dry-run, and restores the backup and
+# skips the reload when sshd -t fails.
+sshd_script() {   # config deny-patterns with-block
+    local block=
+    [ "$3" = 1 ] && block=$MATCH_BLOCK
+    printf 'F=%q\nDENY=%q\nTS=%q\nDRY=%q\nBLOCK=%q\n' "$1" "$2" "$TS" "$DRY" "$block"
+    cat <<'EOS'
+set -euo pipefail
+cd /
+h=$(hostname -s)
+new=$(mktemp "$F.kaiju.XXXXXX")
+trap 'rm -f "$new"' EXIT
+# Extend a global DenyUsers if there is one; otherwise insert one before the first Match.
+awk -v deny="$DENY" '
+    tolower($1) == "match" && !inmatch { if (!seen) { print "DenyUsers " deny; seen = 1 } inmatch = 1 }
+    tolower($1) == "denyusers" && !inmatch && !seen {
+        line = $0; n = split(deny, d, " ")
+        for (i = 1; i <= n; i++) { f = 0; for (j = 2; j <= NF; j++) if ($j == d[i]) f = 1; if (!f) line = line " " d[i] }
+        print line; seen = 1; next
+    }
+    { print }
+    END { if (!seen) print "DenyUsers " deny }' "$F" > "$new"
+if [ -n "$BLOCK" ]; then
+    grep -q '^# BEGIN kaiju-agents' "$new" || printf '\n%s\n' "$BLOCK" >> "$new"
+    if awk 'tolower($1) == "match" {exit} tolower($1) ~ /^allow(users|groups)$/ {f = 1} END {exit !f}' "$F"; then
+        echo "$h: WARNING: AllowUsers/AllowGroups is set; agents cannot log in until $F allows *-agent or kaiju-agents" >&2
+    fi
+fi
+if cmp -s "$F" "$new"; then echo "$h: $F already up to date"; exit 0; fi
+if [ "$DRY" = 1 ]; then echo "$h: would change $F:"; diff -u "$F" "$new" || true; exit 0; fi
+cp -p "$F" "$F.bak-$TS"
+cat "$new" > "$F"
+if ! sshd -t -f "$F"; then
+    cat "$F.bak-$TS" > "$F"
+    echo "$h: sshd -t failed; $F restored from $F.bak-$TS, sshd NOT reloaded" >&2
+    exit 1
+fi
+systemctl reload sshd
+echo "$h: $F updated (backup $F.bak-$TS), sshd reloaded"
+EOS
+}
+
+edit_sshd() {
+    local host=$1 f="$STAGE/sshd-$1.sh"
+    if [ "$host" = login ]; then
+        sshd_script "$SSHD_CONFIG" "$LOGIN_DENY" 1 > "$f"
+        (cd / && sudo bash -s < "$f") || die "login node sshd: stopped"
+    else
+        sshd_script /etc/ssh/sshd_config '*-agent' 0 > "$f"
+        sudo ssh "${SSH_OPTS[@]}" "$host" bash -s < "$f" || die "$host sshd: stopped; the remaining nodes were not changed"
+    fi
+}
+
+root_can_write_home() {
+    local p="$HOMES/.kaiju-agent-probe.$$.$RANDOM"
+    sudo touch "$p" 2>/dev/null && sudo rm -f "$p"
+}
+
+# Root-side home layout. Numeric ids, so it also runs as root on an NFS server that
+# does not know the agent. mkdir (not install -d or mkdir -p) fails on anything already
+# at the path, so nothing planted there is ever followed.
+home_script() {   # agent uid member
+    printf 'H=%q\nSHARE=%q\nA=%q\nU=%q\nM=%q\n' "$HOMES/$1" "$SHARE" "$1" "$2" "$3"
+    cat <<'EOS'
+set -euo pipefail
+cd /
+die() { echo "home setup: $*" >&2; exit 1; }
+rdir() {   # path mode owner:group
+    [ ! -L "$1" ] || die "$1 is a symlink"
+    if [ -e "$1" ]; then
+        [ -d "$1" ] && [ "$(stat -c %u "$1")" = 0 ] || die "$1 exists and is not a root-owned directory; fix it by hand"
+    else
+        mkdir "$1"
+    fi
+    chown -h "$3" "$1"; chmod "$2" "$1"
+}
+rfile() {   # path; content on stdin
+    [ ! -L "$1" ] || die "$1 is a symlink"
+    [ ! -d "$1" ] || die "$1 is a directory"
+    t=$(mktemp "$(dirname "$1")/.kaiju.XXXXXX")
+    cat > "$t"; chown 0:0 "$t"; chmod 0644 "$t"
+    mv -Tf "$t" "$1"
+}
+[ -d "$SHARE" ] && [ ! -L "$SHARE" ] && [ "$(stat -c %u "$SHARE")" = 0 ] || die "$SHARE missing or not root-owned; run baseline"
+
+rdir "$H" 1770 "0:$U"
+rfile "$H/.bashrc" <<'EOF'
+# Root-owned: the agent cannot change its own startup files. Ask the Kaiju admin.
+[ -f /etc/bashrc ] && . /etc/bashrc
+umask 027
+export TMPDIR="$HOME/work/.tmp" APPTAINER_TMPDIR="$HOME/work/.tmp"
+[ -d "$TMPDIR" ] || mkdir -p -m 700 "$TMPDIR"
+export MAKEFLAGS=-j4 GIT_TERMINAL_PROMPT=0
+type module >/dev/null 2>&1 && module load claude-code 2>/dev/null
+EOF
+rfile "$H/.bash_profile" <<'EOF'
+# Root-owned; everything is in ~/.bashrc.
+[ -f ~/.bashrc ] && . ~/.bashrc
+EOF
+rfile "$H/.profile" <<'EOF'
+# Root-owned; bash reads ~/.bash_profile instead.
+umask 027
+EOF
+rfile "$H/.bash_logout" <<'EOF'
+# Root-owned.
+EOF
+# pushInsteadOf turns every push URL into an unknown scheme, so pushes fail; the member
+# pushes from the outbox.
+rfile "$H/.gitconfig" <<EOF
+[user]
+	name = $A (Claude agent for $M)
+	email = $A@kaiju.invalid
+[url "nopush://"]
+	pushInsteadOf = https://
+	pushInsteadOf = http://
+	pushInsteadOf = ssh://
+	pushInsteadOf = git@
+EOF
+rdir "$H/.claude" 1770 "0:$U"
+echo '{}' | rfile "$H/.claude/settings.json"
+rfile "$H/.claude/CLAUDE.md" </dev/null
+rdir "$H/.config" 1770 "0:$U"
+rdir "$SHARE/$A" 0755 0:0
+o=$SHARE/$A/outbox
+[ ! -L "$o" ] || die "$o is a symlink"
+[ -e "$o" ] || mkdir "$o"
+[ -d "$o" ] || die "$o is not a directory"
+chown -h "$U:$U" "$o"; chmod 0755 "$o"
+echo "home setup: $H and $SHARE/$A done"
+EOS
+}
+
+# path uid:gid mode, checked as the agent: it works under root squash, and stat never
+# follows a symlink, so a swapped item shows up as a mismatch.
+layout() {   # agent uid
+    local h=$HOMES/$1 u=$2
+    cat <<EOF
+$h 0:$u 1770
+$h/.claude 0:$u 1770
+$h/.config 0:$u 1770
+$h/.bashrc 0:0 644
+$h/.bash_profile 0:0 644
+$h/.profile 0:0 644
+$h/.bash_logout 0:0 644
+$h/.gitconfig 0:0 644
+$h/.claude/settings.json 0:0 644
+$h/.claude/CLAUDE.md 0:0 644
+$SHARE/$1 0:0 755
+$SHARE/$1/outbox $u:$u 755
+EOF
+}
+
+check_layout() {   # agent uid [extra lines]; prints mismatches, returns 1 if any
+    local want got bad=0 p rest
+    want=$(layout "$1" "$2"; [ -z "${3:-}" ] || printf '%s\n' "$3")
+    got=$(as_user "$1" stat -c '%n %u:%g %a' $(awk '{print $1}' <<<"$want") 2>/dev/null || true)
+    while read -r p rest; do
+        grep -qxF -- "$p $rest" <<<"$got" || { echo "    $p: want $rest, have $(grep -F -- "$p " <<<"$got" | head -n1 | cut -d' ' -f2- || true)"; bad=1; }
+    done <<<"$want"
+    return $bad
+}
+
+# --- precheck ----------------------------------------------------------------
+
+show() { echo "\$ $1"; eval "$1" 2>&1 | sed 's/^/    /' || true; }
+
+cmd_precheck() {
+    local route squash block names allow match ww orx ptrace n h
+    echo "== CPU and memory"
+    show 'nproc'
+    show "lscpu | grep -E '^(CPU\\(s\\)|Thread|Core|Socket|Model name)'"
+    show 'free -g'
+    show 'swapon --show'
+
+    echo "== Name service"
+    show "grep -E '^(passwd|group|shadow):' /etc/nsswitch.conf"
+    show 'for s in ypserv ypbind yppasswdd nscd sssd; do printf "%-10s %s\n" $s "$(systemctl is-active $s)"; done'
+    show 'ypwhich; ypwhich -m passwd.byname'
+    probe_nodes
+    echo "nodes up: ${UP[*]:-none}; down: ${DOWN[*]:-none}; skipped: ${SKIPPED[*]:-none}"
+    route=$(detect_route)
+    n=${UP[0]:-}; [[ " ${UP[*]} " == *" n1 "* ]] && n=n1
+    if [ -n "$n" ]; then
+        h=$(getent group wheel | cut -d: -f4 | tr , '\n' | grep -v -e '-adm$' -e '-agent$' -e '^root$' | head -n1 || true)
+        show "on $n \"grep -E '^(passwd|group):' /etc/nsswitch.conf; echo files: \\\$(getent -s files passwd $h | cut -d: -f1,3); echo nis: \\\$(getent -s nis passwd $h | cut -d: -f1,3)\""
+    fi
+    echo "ROUTE=$route"
+
+    echo "== /home"
+    show 'findmnt -T /home -no SOURCE,FSTYPE,OPTIONS'
+    if root_can_write_home; then squash=no; else squash=yes; fi
+    echo "root on $(hostname -s) can create and remove a file in $HOMES: $([ $squash = no ] && echo yes || echo 'no (root-squashed)')"
+    echo "ROOT_SQUASH=$squash"
+
+    echo "== sshd"
+    show 'ssh -V; rpm -q openssh-server'
+    show "sudo grep -n -i -E '^[[:space:]]*(Match|AllowUsers|AllowGroups|DenyUsers|DenyGroups|Include|AuthorizedKeysFile|AuthorizedKeysCommand)[[:space:]]' $SSHD_CONFIG"
+    match=$(sudo grep -c -i -E '^[[:space:]]*Match[[:space:]]' "$SSHD_CONFIG" 2>/dev/null || true)
+    show "ip -o addr show | awk '{print \$2, \$4}'"
+    echo "agent logins refused from: $LOCAL_NETS (each address above must fall in one)"
+    allow=$(sudo grep -i -E '^[[:space:]]*Allow(Users|Groups)[[:space:]]' "$SSHD_CONFIG" 2>/dev/null || true)
+
+    echo "== uid/gid $AGENT_GID-$LAST_UID"
+    block=$({
+        getent passwd | awk -F: '$3>=7000 && $3<8000 {print "passwd: " $0}'
+        getent group  | awk -F: '$3>=7000 && $3<8000 {print "group: " $0}'
+        ypcat passwd 2>/dev/null | awk -F: '$3>=7000 && $3<8000 {print "nis passwd: " $0}'
+        ypcat group  2>/dev/null | awk -F: '$3>=7000 && $3<8000 {print "nis group: " $0}'
+        awk -F: '$2<8000 && $2+$3>7000 {print FILENAME ": " $0}' "$R/etc/subuid" "$R/etc/subgid" 2>/dev/null
+        for n in "${UP[@]}"; do
+            on "$n" "getent passwd | awk -F: '\$3>=7000 && \$3<8000'; getent group | awk -F: '\$3>=7000 && \$3<8000'" | sed "s/^/$n: /"
+        done
+    } 2>/dev/null | sort -u || true)
+    [ -z "$block" ] && echo "    free on $(hostname -s) ${UP[*]}" || printf '%s\n' "$block" | sed 's/^/    /'
+
+    echo "== existing *-agent names"
+    names=$({
+        getent passwd | cut -d: -f1; getent group | cut -d: -f1
+        for n in "${UP[@]}"; do on "$n" 'getent passwd | cut -d: -f1; getent group | cut -d: -f1'; done
+    } 2>/dev/null | grep -e '-agent$' | sort -u || true)
+    [ -z "$names" ] && echo "    none" || printf '%s\n' "$names" | sed 's/^/    /'
+
+    echo "== Apptainer"
+    show 'apptainer --version; rpm -q apptainer apptainer-suid'
+    show 'p=$(dirname "$(dirname "$(readlink -f "$(command -v apptainer)")")"); ls -l "$p/libexec/apptainer/bin/starter-suid"; grep -H -E "^[[:space:]]*allow setuid" "$p/etc/apptainer/apptainer.conf" /etc/apptainer/apptainer.conf'
+
+    echo "== cgroups and logind"
+    show 'stat -fc %T /sys/fs/cgroup; ls /sys/fs/cgroup'
+    show 'cat /sys/fs/cgroup/memory/user.slice/memory.use_hierarchy; ls /sys/fs/cgroup/memory/memory.memsw.limit_in_bytes'
+    show 'ls /usr/lib/systemd/system/user-.slice.d/'
+    show "busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager KillUserProcesses; grep -i '^[^#]*KillUserProcesses' /etc/systemd/logind.conf"
+    ptrace=$(sysctl -n kernel.yama.ptrace_scope 2>/dev/null || echo unknown)
+    echo "kernel.yama.ptrace_scope = $ptrace"
+
+    echo "== /home permissions"
+    ww=$(sudo find "$HOMES" -maxdepth 3 -type d -perm -0002 ! -perm -1000 2>/dev/null || true)
+    echo "world-writable, non-sticky dirs (maxdepth 3): $(grep -c . <<<"$ww" || true)"
+    [ -z "$ww" ] || head -n 20 <<<"$ww" | sed 's/^/    /'
+    orx=$(sudo find "$HOMES" -mindepth 1 -maxdepth 1 -type d -perm -0005 -printf '%m %u %p\n' 2>/dev/null || true)
+    echo "homes with o+rx (agents can read them): $(grep -c . <<<"$orx" || true)"
+    [ -z "$orx" ] || sed 's/^/    /' <<<"$orx"
+
+    echo "== Summary"
+    echo "ROUTE=$route  ROOT_SQUASH=$squash"
+    echo "uid block 7000-7999:     $([ -z "$block" ] && echo free || echo 'IN USE (see above)')"
+    echo "*-agent names:           $([ -z "$names" ] && echo none || echo "$names" | tr '\n' ' ')"
+    echo "sshd Match blocks:       ${match:-0}; AllowUsers/AllowGroups: $([ -z "$allow" ] && echo none || echo "SET: $allow")"
+    echo "nodes down:              ${DOWN[*]:-none}"
+    echo "ww dirs / o+rx homes:    $(grep -c . <<<"$ww" || true) / $(grep -c . <<<"$orx" || true)  (deferred)"
+    echo "ptrace_scope:            $ptrace  (deferred)"
+    [ "$squash" = no ] || echo "/home is root-squashed: baseline and create print the commands to run on the NFS server."
+    echo "Next: $0 baseline --route $route --dry-run"
+}
+
+# --- baseline ----------------------------------------------------------------
+
+cmd_baseline() {
+    local route n s
+    need_nodes
+    route=$(choose_route)
+    echo "route:      $route"
+
+    if [ "$route" = nis ]; then
+        systemctl -q is-active ypserv || die "route nis needs the NIS master; ypserv is not running on $(hostname -s)"
+    fi
+    run_sh login "$(ensure_group_cmd "$AGENT_GROUP" "$AGENT_GID")"
+    if [ "$route" = local ]; then
+        run_sh_nodes "$(ensure_group_cmd "$AGENT_GROUP" "$AGENT_GID")"
+    elif nodes_resolve group "$AGENT_GROUP" "$AGENT_GID"; then
+        echo "present:    group $AGENT_GROUP ($AGENT_GID) on ${UP[*]}"
+    else
+        nis_publish
+    fi
+
+    edit_sshd login
+
+    run sudo install -d -m 0755 -o root -g root "$KEYDIR"
+    restorecon_if "$KEYDIR"
+
+    printf '%s\n' "$POLKIT_RULE" > "$STAGE/polkit.rules"
+    put_root_file "$STAGE/polkit.rules" "$R/etc/polkit-1/rules.d/10-kaiju-agents.rules" 0644
+
+    if sudo test -L "$SHARE"; then die "$SHARE is a symlink"; fi
+    if root_can_write_home; then
+        run sudo install -d -m 0755 -o root -g root "$SHARE"
+    elif ! sudo test -d "$SHARE"; then
+        warn "/home is root-squashed here. As root on the NFS server for /home, run:"
+        echo "    install -d -m 0755 -o root -g root /home/agent-share"
+    fi
+
+    run sudo install -d -m 0755 -o root -g root "$STATE" "$STATE/keys"
+    if ! sudo test -e "$REG"; then
+        printf '# agent\tuid\tmember\tstatus\tcreated\texpires\tkeyfp\n' > "$STAGE/registry.tsv"
+        put_root_file "$STAGE/registry.tsv" "$REG" 0644
+    fi
+    echo "$route" > "$STAGE/route"
+    put_root_file "$STAGE/route" "$STATE/route" 0644
+
+    for n in "${UP[@]}"; do edit_sshd "$n"; done
+
+    if [ ${#SKIPPED[@]} -gt 0 ]; then
+        drain_skipped "baseline pending"
+        echo "SKIPPED:    ${SKIPPED[*]} — drained. Once back: $0 baseline, then sudo scontrol update nodename=<n> state=resume"
+    fi
+    log "baseline route=$route nodes=${UP[*]} skipped=${SKIPPED[*]}"
+    echo "baseline done. Next: $(dirname "$0")/../kaiju_claude_install.sh policy (checks $AGENT_GROUP is gid $AGENT_GID), then $0 create <member> --pubkey FILE --dry-run"
+}
+
+# --- create ------------------------------------------------------------------
+
+cmd_create() {
+    local member=$1 agent route ent muid mhome uid exp created ktype kb64 fp bits f fps st n squash
+    [[ $member =~ ^[a-z_][a-z0-9_.-]*$ ]] || die "bad member name '$member'"
+    case $member in root|*-adm|*-agent) die "$member cannot have an agent account" ;; esac
+    agent=$member-agent
+    [ ${#agent} -le 32 ] || die "$agent is longer than 32 characters"
+    [ -n "$PUBKEY" ] || die "--pubkey FILE is required"
+    [[ $CPU =~ ^[0-9]+%$ ]] || die "--cpu wants e.g. 800%"
+    [[ $MEM =~ ^[0-9]+[KMGT]$ ]] || die "--mem wants e.g. 32G"
+    [[ $TASKS =~ ^[0-9]+$ ]] || die "--tasks wants a number"
+
+    ent=$(getent passwd "$member") || die "no such user: $member"
+    muid=$(cut -d: -f3 <<<"$ent"); mhome=$(cut -d: -f6 <<<"$ent")
+    [ "$muid" -ge 1000 ] || die "$member (uid $muid) is a system account"
+    if [ "$muid" -ge "$AGENT_GID" ] && [ "$muid" -le "$LAST_UID" ]; then die "$member's uid $muid is in the agent block"; fi
+
+    st=$(reg_get "$agent" 4)
+    [ "$st" != suspended ] || die "$agent is suspended; use: $0 resume $agent"
+    [ "$st" != retired ] || die "$agent is retired; its uid is not reused"
+
+    # The key: one bare public key line, re-written by us so no options or comment get through.
+    [ -r "$PUBKEY" ] || die "cannot read $PUBKEY"
+    [ "$(grep -c -v -e '^[[:space:]]*$' -e '^#' "$PUBKEY" || true)" = 1 ] || die "$PUBKEY must hold exactly one public key line"
+    read -r ktype kb64 _ < <(grep -v -e '^[[:space:]]*$' -e '^#' "$PUBKEY")
+    case $ktype in ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) ;;
+        *) die "$PUBKEY: '$ktype' is not a key type OpenSSH 8.0 accepts here (it must start with the type, no options)" ;; esac
+    [[ $kb64 =~ ^[A-Za-z0-9+/]+=*$ ]] || die "$PUBKEY: bad key data"
+    printf '%s %s %s\n' "$ktype" "$kb64" "$agent" > "$STAGE/key.pub"
+    read -r bits fp _ < <(ssh-keygen -lf "$STAGE/key.pub") || die "$PUBKEY is not a valid public key"
+    [ "$ktype" != ssh-rsa ] || [ "$bits" -ge 3072 ] || die "RSA key of $bits bits; ask for ed25519"
+    for f in "$mhome/.ssh/authorized_keys" "$mhome/.ssh/authorized_keys2"; do
+        as_user "$member" test -e "$f" 2>/dev/null || continue
+        fps=$(as_user "$member" ssh-keygen -lf "$f" 2>/dev/null) || die "cannot read $f as $member; check the key by hand"
+        if awk '{print $2}' <<<"$fps" | grep -qxF -- "$fp"; then
+            die "this key is already in $member's own $f: ask for a NEW key (e.g. ~/.ssh/id_ed25519_kaiju_agent)"
+        fi
+    done
+    echo "key:        $fp ($ktype)"
+
+    need_nodes
+    route=$(choose_route)
+    if ! getent group "$AGENT_GROUP" >/dev/null || ! sudo test -d "$STATE"; then
+        [ "$DRY" = 1 ] && warn "baseline has not run yet; this preview assumes it has" || die "run $0 baseline first"
+    fi
+    if [ "$route" = nis ] && [ "$DRY" = 0 ]; then
+        systemctl -q is-active ypserv || die "route nis needs the NIS master; ypserv is not running on $(hostname -s)"
+    fi
+
+    uid=$(getent passwd "$agent" | cut -d: -f3 || true)
+    if [ -n "$uid" ]; then
+        [ -z "$UID_OPT" ] || [ "$UID_OPT" = "$uid" ] || die "$agent exists with uid $uid, not $UID_OPT"
+        echo "present:    $agent (uid $uid); filling in anything missing"
+    elif [ -n "$(reg_get "$agent" 2)" ]; then
+        uid=$(reg_get "$agent" 2)
+        [ -z "$UID_OPT" ] || [ "$UID_OPT" = "$uid" ] || die "registry has $agent at uid $uid, not $UID_OPT"
+    else
+        uid=${UID_OPT:-$(awk -F'\t' -v m=$((FIRST_UID - 1)) '!/^#/ && $2 > m {m = $2} END {print m + 1}' "$REG" 2>/dev/null || echo "$FIRST_UID")}
+        local taken
+        taken=$({
+            getent passwd "$uid"; getent passwd "$agent"; getent group "$uid"; getent group "$agent"
+            ypcat passwd 2>/dev/null | awk -F: -v i="$uid" -v a="$agent" '$3==i || $1==a'
+            ypcat group 2>/dev/null | awk -F: -v i="$uid" -v a="$agent" '$3==i || $1==a'
+            awk -F: -v i="$uid" 'i >= $2 && i < $2 + $3 {print FILENAME ": " $0}' "$R/etc/subuid" "$R/etc/subgid"
+            for n in "${UP[@]}"; do on "$n" "getent passwd $uid $agent; getent group $uid $agent" | sed "s/^/$n: /"; done
+        } 2>/dev/null || true)
+        [ -z "$taken" ] || die "uid/gid $uid or the name $agent is taken (pick another with --uid):
+$taken"
+    fi
+    [[ $uid =~ ^[0-9]+$ ]] && [ "$uid" -ge "$FIRST_UID" ] && [ "$uid" -le "$LAST_UID" ] || die "uid $uid is outside $FIRST_UID-$LAST_UID"
+    exp=$(reg_get "$agent" 6); [ -n "$exp" ] || exp=$(date -d '+1 year' +%F)
+    created=$(reg_get "$agent" 5); [ -n "$created" ] || created=$(date +%F)
+    echo "agent:      $agent uid=gid=$uid member=$member route=$route expires=$exp"
+
+    # Account. -M: the home is laid out below, never by useradd's skeleton copy.
+    local acct
+    acct="set -eu
+$(ensure_group_cmd "$agent" "$uid")
+c=\$(getent passwd $agent | cut -d: -f3)
+if [ -z \"\$c\" ]; then useradd -M -u $uid -g $uid -G $AGENT_GROUP -d /home/$agent -s /bin/bash -c 'Claude agent for $member' $agent
+elif [ \"\$c\" != $uid ]; then echo \"\$(hostname -s): $agent has uid \$c, expected $uid\" >&2; exit 1
+fi
+usermod -L $agent
+chage -E $exp $agent
+if systemctl -q is-active nscd; then nscd -i passwd; nscd -i group; fi"
+    run_sh login "$acct"
+    if [ "$route" = nis ]; then
+        if nodes_resolve passwd "$agent" "$uid"; then
+            echo "present:    $agent on ${UP[*]}"
+        else
+            nis_publish
+            [ "$DRY" = 1 ] || nodes_resolve passwd "$agent" "$uid" \
+                || warn "not every node resolves $agent as $uid yet (ypbind cache?); check: sudo ssh nN id $agent"
+        fi
+    else
+        run_sh_nodes "$acct"
+    fi
+
+    # Home and outbox. The key goes in last, so the agent cannot log in to a half-built home.
+    home_script "$agent" "$uid" "$member" > "$STAGE/home.sh"
+    if [ "$DRY" = 0 ] && check_layout "$agent" "$uid" >/dev/null; then
+        echo "present:    home layout for $agent"
+    elif root_can_write_home; then
+        if [ "$DRY" = 1 ]; then echo "+ [login] as root:"; sed 's/^/    /' "$STAGE/home.sh"
+        else (cd / && sudo bash -s < "$STAGE/home.sh"); fi
+    else
+        cp "$STAGE/home.sh" "$R/tmp/kaiju-agent-home-$agent.sh"
+        warn "/home is root-squashed here. As root on the NFS server for /home (adjust H and SHARE if it
+            exports another path), run $R/tmp/kaiju-agent-home-$agent.sh, i.e.:"
+        sed 's/^/    /' "$STAGE/home.sh"
+        [ "$DRY" = 1 ] || die "then rerun this same create command; the account exists, no key is installed yet"
+    fi
+    if [ "$DRY" = 0 ]; then
+        check_layout "$agent" "$uid" || die "home layout of $agent is not as expected (above); fix it before the key goes in"
+    fi
+
+    local d p m
+    for d in "work:0750" "work/.tmp:0700" ".cache:0700" ".config/kaiju-agent:0700"; do
+        p=$HOMES/$agent/${d%:*}; m=${d##*:}
+        if [ "$DRY" = 0 ] && as_user "$agent" test -L "$p"; then die "$p is a symlink"; fi
+        run as_user "$agent" install -d -m "$m" "$p"
+    done
+    if [ "$DRY" = 1 ] || ! as_user "$agent" test -e "$HOMES/$agent/outbox"; then
+        run as_user "$agent" ln -s "$SHARE/$agent/outbox" "$HOMES/$agent/outbox"
+    fi
+
+    add_line "$R/etc/cron.deny" "$agent"
+    add_line "$R/etc/at.deny" "$agent"
+    sudo test ! -e "$R/etc/cron.allow" || warn "/etc/cron.allow exists: keep $agent out of it"
+    # The agent's jobs run on every node: a crontab or at job there would outlive the job and Slurm's limits.
+    run_sh_nodes "set -eu
+for f in /etc/cron.deny /etc/at.deny; do
+    [ -e \"\$f\" ] || install -m 0600 /dev/null \"\$f\"
+    grep -qxF -- '$agent' \"\$f\" || echo '$agent' >> \"\$f\"
+done"
+
+    local sd="$UNITS/user-$uid.slice.d"
+    printf '# %s; written by kaiju-agent\n[Slice]\nCPUAccounting=yes\nCPUQuota=%s\nCPUShares=256\nMemoryAccounting=yes\nMemoryLimit=%s\nTasksAccounting=yes\nTasksMax=%s\n' \
+        "$agent" "$CPU" "$MEM" "$TASKS" > "$STAGE/slice.conf"
+    run sudo install -d -m 0755 -o root -g root "$sd"
+    put_root_file "$STAGE/slice.conf" "$sd/50-kaiju-agent.conf" 0644
+    run sudo systemctl daemon-reload
+    if systemctl -q is-active "user-$uid.slice" 2>/dev/null; then
+        run sudo systemctl set-property --runtime "user-$uid.slice" CPUQuota="$CPU" CPUShares=256 MemoryLimit="$MEM" TasksMax="$TASKS"
+    fi
+
+    printf 'restrict,pty,from="%s" %s\n' "$KEY_FROM" "$(cat "$STAGE/key.pub")" > "$STAGE/authkey"
+    put_root_file "$STAGE/authkey" "$STATE/keys/$agent.pub" 0644 nobak
+    put_root_file "$STAGE/authkey" "$KEYDIR/$agent" 0644 nobak
+    restorecon_if "$KEYDIR"
+
+    reg_set "$agent" "$uid" "$member" active "$created" "$exp" "$fp"
+    log "create $agent uid=$uid member=$member key=$fp cpu=$CPU mem=$MEM tasks=$TASKS route=$route"
+
+    if [ ${#SKIPPED[@]} -gt 0 ]; then
+        if [ "$route" = local ]; then drain_skipped "$agent not created yet"; else drain_skipped "kaiju-agent baseline pending"; fi
+        echo "SKIPPED:    ${SKIPPED[*]} — drained. Once back: $0 baseline; $0 create $member --pubkey $PUBKEY (safe to rerun);"
+        echo "            $0 audit $agent; then sudo scontrol update nodename=<n> state=resume"
+    fi
+
+    [ "$DRY" = 0 ] || { echo; echo "dry run: nothing changed."; return; }
+    cat <<EOF
+
+created $agent. Send $member agents/MEMBER.md and these steps:
+
+1. Laptop ~/.ssh/config, above any "Host *" block:
+     Host kaiju-agent
+         HostName kaiju.anu.edu.au
+         User $agent
+         IdentityFile ~/.ssh/id_ed25519_kaiju_agent
+         IdentitiesOnly yes
+         ForwardAgent no
+         ForwardX11 no
+         ClearAllForwardings yes
+         ControlMaster no
+         ControlPath none
+2. On the laptop: claude setup-token   (inference-only, 1 year; never /login in the agent account)
+3. ssh kaiju-agent, then store the token without echo or history:
+     ( umask 077; IFS= read -rs T; printf '%s\n' "\$T" > ~/.config/kaiju-agent/oauth-token )
+4. tmux new -A -s claude; module load claude-code; cd ~/work/<project>; claude-agent
+   /status must show the token as the auth source.
+5. Results and patches: /home/agent-share/$agent/outbox (readable by you).
+   Never ssh to the agent from Kaiju, and never su/sudo -u into it.
+
+Verify (admin):
+  $0 audit $agent
+  sudo sshd -T -C user=$agent,host=x,addr=203.0.113.5,laddr=$LOGIN_IP,lport=22 | grep -Ei '^(authorizedkeysfile|authenticationmethods|allowagentforwarding|allowtcpforwarding|x11forwarding|permittty|permituserrc) '
+  sudo sshd -T -C user=$member,host=x,addr=203.0.113.5,laddr=$LOGIN_IP,lport=22 | grep -i '^authorizedkeysfile'   # must be the default
+  for n in ${UP[*]}; do sudo ssh -o BatchMode=yes \$n "id $agent; sshd -T | grep -i ^denyusers"; done
+  While $agent has a session (expect $(( ${CPU%\%} * 1000 )) 100000 $(numfmt --from=iec "$MEM" 2>/dev/null || echo "<$MEM in bytes>") $TASKS):
+  S=user.slice/user-$uid.slice; cat /sys/fs/cgroup/cpu,cpuacct/\$S/cpu.cfs_quota_us /sys/fs/cgroup/cpu,cpuacct/\$S/cpu.cfs_period_us /sys/fs/cgroup/memory/\$S/memory.limit_in_bytes /sys/fs/cgroup/pids/\$S/pids.max
+  systemctl show user-$uid.slice -p DropInPaths -p CPUQuotaPerSecUSec -p MemoryLimit -p TasksMax
+  ps -o pid,user:16,comm,cgroup -u $agent      # every process inside user-$uid.slice
+EOF
+}
+
+# --- suspend / resume --------------------------------------------------------
+
+agent_arg() {
+    [[ ${1:-} == *-agent ]] || die "give the agent name, e.g. jdoe-agent"
+    [ -n "$(reg_get "$1" 2)" ] || getent passwd "$1" >/dev/null || die "unknown agent: $1"
+}
+
+# Best effort: one failed step must not stop the rest of the off switch.
+try() { "$@" || { warn "failed: $*"; FAILS=$((FAILS + 1)); }; }
+
+cmd_suspend() {
+    local a=$1 n route
+    FAILS=0
+    : > "$STAGE/empty"
+    try put_root_file "$STAGE/empty" "$KEYDIR/$a" 0644 nobak
+    try run sudo chage -E 0 "$a"
+    try run sudo loginctl terminate-user "$a"
+    run sudo pkill -KILL -u "$a" || true
+    try run sudo scancel -u "$a"
+    probe_nodes
+    route=$(cat "$STATE/route" 2>/dev/null || echo unknown)
+    if [ "$route" = local ]; then try run_sh_nodes "chage -E 0 $a; pkill -KILL -u $a; true"
+    else try run_sh_nodes "pkill -KILL -u $a; true"; fi
+    try reg_status "$a" suspended
+    log "suspend $a"
+    [ ${#DOWN[@]} -eq 0 ] && [ ${#SKIPPED[@]} -eq 0 ] \
+        || warn "not reached: ${DOWN[*]} ${SKIPPED[*]} — once back: sudo ssh <n> pkill -KILL -u $a"
+    echo "check: squeue -h -u $a; pgrep -u $a; sudo cat $KEYDIR/$a   (all empty)"
+    echo "If the token may have leaked, $(reg_get "$a" 3) revokes it in claude.ai settings."
+    [ "$FAILS" -eq 0 ] || exit 1
+}
+
+cmd_resume() {
+    local a=$1 exp n route
+    sudo test -s "$STATE/keys/$a.pub" || die "no saved key in $STATE/keys/$a.pub; run create again"
+    exp=$(reg_get "$a" 6)
+    [ -n "$exp" ] || die "no expiry date for $a in $REG"
+    [[ $exp > $(date +%F) ]] || warn "$a's expiry $exp has passed; the account stays expired until you renew it (chage -E)"
+    put_root_file "$STATE/keys/$a.pub" "$KEYDIR/$a" 0644 nobak
+    run sudo chage -E "$exp" "$a"
+    route=$(cat "$STATE/route" 2>/dev/null || echo unknown)
+    if [ "$route" = local ]; then
+        probe_nodes
+        run_sh_nodes "chage -E $exp $a"
+    fi
+    reg_status "$a" active
+    log "resume $a"
+}
+
+# --- audit / list ------------------------------------------------------------
+
+audit_one() {
+    local a=$1 uid st h bad=0 n got want kf f v cpu mem tasks sd S C=/sys/fs/cgroup
+    uid=$(reg_get "$a" 2); st=$(reg_get "$a" 4); h=$HOMES/$a
+    fail() { echo "FAIL  $a: $*"; bad=1; }
+    pass() { echo "ok    $a: $*"; }
+
+    [ -n "$uid" ] || { fail "not in $REG"; return 1; }
+    want="$a $AGENT_GROUP"
+    got=$(id -u "$a" 2>/dev/null || true)
+    [ "$got" = "$uid" ] && pass "uid $uid on $(hostname -s)" || fail "uid on $(hostname -s) is '$got', registry says $uid"
+    got=$(id -nG "$a" 2>/dev/null || true)
+    [ "$got" = "$want" ] && pass "groups '$want'" || fail "groups on $(hostname -s) are '$got', want '$want'"
+    for n in "${UP[@]}"; do
+        got=$(on "$n" "id -u $a; id -nG $a" 2>/dev/null | tr '\n' ' ' || true)
+        [ "$got" = "$uid $want " ] && pass "$n: uid and groups" || fail "$n: '$got', want '$uid $want'"
+    done
+    got=$({ getent group; ypcat group 2>/dev/null; } | awk -F: -v a="$a" -v g="$AGENT_GROUP" '$1 != g && $1 != a && ("," $4 ",") ~ ("," a ",") {print $1}' | sort -u | tr '\n' ' ' || true)
+    [ -z "$got" ] && pass "in no other group" || fail "also a member of: $got"
+
+    got=$(sudo passwd -S "$a" 2>/dev/null | awk '{print $2}' || true)
+    [ "$got" = LK ] && pass "password locked" || fail "passwd -S says '$got', want LK"
+    got=$(sudo chage -l "$a" 2>/dev/null | awk -F': ' '/^Account expires/ {print $2}' || true)
+    [ -n "$got" ] && [ "$got" != never ] && pass "expires $got" || fail "account expiry is '$got'"
+    sudo sudo -l -U "$a" 2>/dev/null | grep -q 'is not allowed to run sudo' && pass "no sudo" || fail "sudo -l -U $a does not deny"
+
+    kf=$KEYDIR/$a
+    got=$(sudo stat -c '%u:%g %a' "$kf" 2>/dev/null || true)
+    [ "$got" = "0:0 644" ] && pass "key file root 0644" || fail "$kf is '$got', want 0:0 644"
+    got=$(sudo grep -c . "$kf" 2>/dev/null || true)
+    if [ "$st" = suspended ]; then
+        [ "${got:-0}" = 0 ] && pass "key file empty (suspended)" || fail "suspended but $kf holds $got key(s)"
+    else
+        [ "$got" = 1 ] && sudo grep -q '^restrict,pty,from="' "$kf" && pass "one restricted key" || fail "$kf: want one restrict,pty,from= line, has $got"
+        sudo grep -qF "restrict,pty,from=\"$KEY_FROM\" " "$kf" && pass "key refused from this host's networks" \
+            || fail "$kf: from= is not \"$KEY_FROM\" (networks changed? rerun create with the same key)"
+    fi
+    local deny net miss=
+    deny=$(sudo sshd -T -C "user=$a,host=x,addr=203.0.113.5,laddr=$LOGIN_IP,lport=22" 2>/dev/null \
+        | awk 'tolower($1) == "denyusers" {for (i = 2; i <= NF; i++) print $i}' || true)
+    for net in $LOCAL_NETS; do grep -qxF -- "*-agent@$net" <<<"$deny" || miss="$miss $net"; done
+    [ -z "$miss" ] && pass "DenyUsers covers this host's networks" || fail "login node DenyUsers misses:$miss (rerun baseline)"
+
+    for f in .ssh/authorized_keys .ssh/authorized_keys2 .claude/.credentials.json .bash_login; do
+        as_user "$a" test -e "$h/$f" 2>/dev/null && fail "$h/$f exists" || pass "no ~/$f"
+    done
+    sudo test -e "$R/var/lib/systemd/linger/$a" && fail "linger is on (loginctl disable-linger $a)" || pass "no linger"
+    sudo test -e "$R/var/spool/cron/$a" && fail "crontab exists ($R/var/spool/cron/$a)" || pass "no crontab"
+    got=$(sudo atq 2>/dev/null | awk -v a="$a" '$NF == a' || true)
+    [ -z "$got" ] && pass "no at jobs" || fail "at jobs: $got"
+    for f in cron.deny at.deny; do
+        sudo grep -qxF -- "$a" "$R/etc/$f" 2>/dev/null && pass "in /etc/$f" || fail "missing from /etc/$f"
+    done
+    for n in "${UP[@]}"; do
+        on "$n" "grep -qxF -- '$a' /etc/cron.deny && grep -qxF -- '$a' /etc/at.deny && ! test -e /var/spool/cron/$a" 2>/dev/null \
+            && pass "$n: in cron.deny and at.deny, no crontab" || fail "$n: not in cron.deny or at.deny, or a crontab exists"
+    done
+
+    if got=$(check_layout "$a" "$uid" "$h/work $uid:$uid 750
+$h/.config/kaiju-agent $uid:$uid 700"); then pass "home, .claude, .config, startup files, outbox: owners and modes"
+    else fail "home layout:"; echo "$got"; fi
+
+    sd=$UNITS/user-$uid.slice.d/50-kaiju-agent.conf
+    if sudo test -f "$sd"; then
+        pass "slice drop-in $sd"
+        if systemctl -q is-active "user-$uid.slice" 2>/dev/null; then
+            cpu=$(awk -F= '$1 == "CPUQuota" {sub(/%/, "", $2); print $2 * 1000}' "$sd")
+            mem=$(awk -F= '$1 == "MemoryLimit" {v = $2; u = substr(v, length(v)); v = substr(v, 1, length(v) - 1)
+                       print v * (u == "K" ? 1024 : u == "M" ? 1048576 : u == "G" ? 1073741824 : 1099511627776)}' "$sd")
+            tasks=$(awk -F= '$1 == "TasksMax" {print $2}' "$sd")
+            S=user.slice/user-$uid.slice
+            v="$(cat "$C/cpu,cpuacct/$S/cpu.cfs_quota_us" "$C/memory/$S/memory.limit_in_bytes" "$C/pids/$S/pids.max" 2>/dev/null | tr '\n' ' ')"
+            [ "$v" = "$cpu $mem $tasks " ] && pass "sysfs limits $v" || fail "sysfs limits '$v', want '$cpu $mem $tasks '"
+        else
+            pass "no active session; sysfs limits not checked"
+        fi
+    else
+        fail "no slice drop-in $sd"
+    fi
+    return $bad
+}
+
+cmd_audit() {
+    local a bad=0 agents
+    probe_nodes
+    [ ${#DOWN[@]} -eq 0 ] || warn "not reached: ${DOWN[*]}"
+    if [ -n "${1:-}" ]; then agents=$1
+    else agents=$(awk -F'\t' '!/^#/ && $4 != "retired" {print $1}' "$REG" 2>/dev/null || true)
+    fi
+    [ -n "$agents" ] || die "no agents in $REG"
+    for a in $agents; do audit_one "$a" || bad=1; done
+    [ "$bad" = 0 ] && echo "audit: clean" || { echo "audit: VIOLATIONS above" >&2; exit 1; }
+}
+
+cmd_list() {
+    [ -f "$REG" ] || die "no registry yet ($REG); run baseline"
+    printf '%-20s %-5s %-12s %-9s %-10s %-10s %-6s %-5s %-4s %s\n' agent uid member status created expires key procs jobs keyfp
+    awk -F'\t' '!/^#/ && NF' "$REG" | while IFS=$'\t' read -r a uid m st c e fp; do
+        local key procs jobs
+        key=$(sudo grep -c . "$KEYDIR/$a" 2>/dev/null || true)
+        [ "${key:-0}" -gt 0 ] && key=on || key=off
+        procs=$(pgrep -c -u "$a" 2>/dev/null || true)
+        jobs=$(squeue -h -u "$a" 2>/dev/null | wc -l | tr -d ' ' || true)
+        printf '%-20s %-5s %-12s %-9s %-10s %-10s %-6s %-5s %-4s %s\n' "$a" "$uid" "$m" "$st" "$c" "$e" "$key" "${procs:-0}" "${jobs:-?}" "$fp"
+    done
+}
+
+usage() { sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+
+MODE=${1:-}
+[ $# -gt 0 ] && shift
+ARGS=()
+while [ $# -gt 0 ]; do
+    case $1 in
+        --dry-run) DRY=1 ;;
+        --pubkey)  PUBKEY=${2:?--pubkey needs a file}; shift ;;
+        --uid)     UID_OPT=${2:?--uid needs a number}; shift ;;
+        --cpu)     CPU=${2:?--cpu needs a value}; shift ;;
+        --mem)     MEM=${2:?--mem needs a value}; shift ;;
+        --tasks)   TASKS=${2:?--tasks needs a value}; shift ;;
+        --route)   ROUTE_OPT=${2:?--route needs nis or local}; shift
+                   case $ROUTE_OPT in nis|local) ;; *) die "--route is nis or local" ;; esac ;;
+        -h|--help) usage ;;
+        -*)        die "unknown option $1" ;;
+        *)         ARGS+=("$1") ;;
+    esac
+    shift
+done
+
+case $MODE in
+    precheck) cmd_precheck ;;
+    baseline) cmd_baseline ;;
+    create)   [ ${#ARGS[@]} -eq 1 ] || usage; cmd_create "${ARGS[0]}" ;;
+    suspend)  [ ${#ARGS[@]} -eq 1 ] || usage; agent_arg "${ARGS[0]}"; cmd_suspend "${ARGS[0]}" ;;
+    resume)   [ ${#ARGS[@]} -eq 1 ] || usage; agent_arg "${ARGS[0]}"; cmd_resume "${ARGS[0]}" ;;
+    audit)    cmd_audit "${ARGS[0]:-}" ;;
+    list)     cmd_list ;;
+    *)        usage ;;
+esac

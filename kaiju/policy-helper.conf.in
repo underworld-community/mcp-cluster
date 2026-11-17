@@ -1,0 +1,7 @@
+# Installed as /etc/claude-code/policy-helper.conf by kaiju_claude_install.sh, which
+# fills in HUMAN_GIDS from the login node's groups; read by policy-helper.
+AGENT_GID=7000
+AGENT_UID_MIN=7000
+AGENT_UID_MAX=7999
+# @HUMAN_GROUPS@: an account in any of these never gets the agent policy.
+HUMAN_GIDS="@HUMAN_GIDS@"

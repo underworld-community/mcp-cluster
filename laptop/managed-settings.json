@@ -1,0 +1,52 @@
+{
+  "allowManagedHooksOnly": true,
+  "allowManagedMcpServersOnly": true,
+  "allowedMcpServers": [
+    {"serverCommand": ["/usr/bin/env", "-i", "/usr/bin/python3", "-I", "${HOME}/.local/share/uw3-hpc/hpc_mcp.py",
+                       "serve"]},
+    {"serverCommand": ["/usr/bin/env", "-i", "${HOME}/.local/share/uw3-mcp/bin/python", "-I", "-m", "uw3_mcp"]},
+    {"serverUrl": "https://*/*"}
+  ],
+  "disabledMcpjsonServers": ["hpc", "underworld3"],
+  "hooks": {
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command":
+      "/bin/sh \"$HOME/.local/share/uw3-hpc/uw3hpc/hooks/notify.sh\" start"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command":
+      "/bin/sh \"$HOME/.local/share/uw3-hpc/uw3hpc/hooks/notify.sh\" stop"}]}],
+    "Notification": [{"hooks": [{"type": "command", "command":
+      "/bin/sh \"$HOME/.local/share/uw3-hpc/uw3hpc/hooks/notify.sh\" wait"}]}]
+  },
+  "permissions": {
+    "disableBypassPermissionsMode": "disable",
+    "ask": ["mcp__hpc__submit", "mcp__hpc__put", "mcp__hpc__run", "mcp__hpc__cancel", "mcp__hpc__task",
+            "Bash(ssh *)", "Bash(scp *)", "Bash(sftp *)", "Bash(rsync *)", "Edit(~/.zshrc)", "Edit(~/.zprofile)",
+            "Edit(~/.zshenv)", "Edit(~/.zlogin)", "Edit(~/.zlogout)", "Edit(~/.bashrc)", "Edit(~/.bash_profile)",
+            "Edit(~/.bash_login)", "Edit(~/.bash_logout)", "Edit(~/.bash_aliases)", "Edit(~/.profile)",
+            "Edit(~/.tmux.conf)", "Edit(~/.gitconfig)", "Edit(~/.bashrc.d/**)", "Edit(~/.config/git/**)",
+            "Edit(~/bin/**)", "Edit(~/.local/bin/**)", "Edit(~/Library/LaunchAgents/**)",
+            "Edit(~/.config/autostart/**)", "Edit(~/.config/systemd/**)"],
+    "deny": ["Edit(~/.local/share/uw3-hpc/**)", "Edit(~/.config/uw3-hpc/**)", "Edit(~/.cache/uw3-hpc/**)",
+             "Edit(~/.local/share/uw3-mcp/**)", "Edit(~/.claude.json)", "Edit(~/.claude/settings*.json)",
+             "Edit(~/.claude/skills/**)", "Edit(~/.claude/agents/**)", "Edit(~/.claude/plugins/**)",
+             "Edit(**/.claude/settings*.json)", "Edit(**/.claude/launch.json)", "Edit(**/.claude/hooks/**)",
+             "Edit(**/.mcp.json)", "Edit(~/.ssh/**)", "Read(~/.ssh/**)"]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyRead": ["~/.ssh"],
+      "denyWrite": [
+        "~/.zshrc", "~/.zprofile", "~/.zshenv", "~/.zlogin", "~/.zlogout", "~/.bashrc", "~/.bash_profile",
+        "~/.bash_login", "~/.bash_logout", "~/.bash_aliases", "~/.profile", "~/.tmux.conf", "~/.gitconfig",
+        "~/.bashrc.d", "~/.config/git", "~/bin", "~/.local/bin", "~/Library/LaunchAgents"]
+    },
+    "network": {
+      "allowAllUnixSockets": false,
+      "allowLocalBinding": true,
+      "deniedDomains": ["data-mover.pawsey.org.au", "gadi-dm.nci.org.au", "gadi.nci.org.au", "kaiju.anu.edu.au",
+                        "setonix.pawsey.org.au", "*.nci.org.au", "*.pawsey.org.au", "150.203.8.145"]
+    }
+  }
+}

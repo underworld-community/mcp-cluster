@@ -1,0 +1,42 @@
+#%Module1.0
+##
+## Claude Code (Anthropic's coding agent) for the Kaiju login node
+## Shared install: /opt/cluster/software/claude-code
+##
+## Usage: module load claude-code
+##
+## Admin: install/update with kaiju/kaiju_claude_install.sh (mcp-cluster repo). The cluster
+## policy lives in /etc/claude-code/ on every node, not in this file.
+
+proc ModulesHelp { } {
+    puts stderr "Claude Code, Anthropic's coding agent, for use on the Kaiju login node."
+    puts stderr ""
+    puts stderr "First time only, in a plain ssh session (not tmux, so the login URL copies"
+    puts stderr "cleanly): module load claude-code, run claude, and sign in with your own"
+    puts stderr "account. Press c to copy the URL, open it on your laptop, paste the code back."
+    puts stderr ""
+    puts stderr "Then, every time:"
+    puts stderr "  tmux new -A -s claude        # Ctrl-b d to leave it running"
+    puts stderr "  module load claude-code"
+    puts stderr "  cd ~/my-project && claude    # a project folder, never your home directory"
+    puts stderr ""
+    puts stderr "Commands run in a sandbox, except sbatch, srun and apptainer, which run"
+    puts stderr "as you without asking (for now); scancel asks."
+    puts stderr "Agent accounts (*-agent) start it with claude-agent instead of claude."
+    puts stderr "Guide: kaiju/README.md in the mcp-cluster repository"
+}
+
+module-whatis "Claude Code coding agent (shared install; policy in /etc/claude-code)"
+
+# Without the policy Claude would run unsandboxed, so refuse rather than load. A
+# node that was down during an install is the usual cause.
+if {[module-info mode load] && ![file readable /etc/claude-code/managed-settings.json]} {
+    puts stderr "Claude Code policy is missing on [info hostname]; tell the Kaiju admin."
+    break
+}
+
+# current is a symlink swapped on update. A running session keeps the binary it
+# started with, so an update never pulls the executable out from under it.
+prepend-path PATH /opt/cluster/software/claude-code/current/bin
+# claude-agent, the wrapper agent accounts start Claude with.
+prepend-path PATH /opt/cluster/software/claude-code/bin

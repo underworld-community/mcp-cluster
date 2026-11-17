@@ -1,0 +1,39 @@
+#!/bin/sh -p
+# Starts Claude Code for a Kaiju agent account with the member's inference-only token
+# (`claude setup-token`) from ~/.config/kaiju-agent/oauth-token. Installed root-owned in
+# /opt/cluster/software/claude-code/bin so the agent cannot rewrite it.
+
+CALLER_PATH=$PATH
+PATH=/usr/bin:/bin
+export PATH
+
+die() {
+    printf 'claude-agent: %s\n' "$*" >&2
+    exit 1
+}
+
+uid=$(id -u) || die "cannot read uid"
+name=$(id -un) || die "cannot resolve the name of uid $uid"
+case $name in *-agent) ;; *) die "only for Kaiju agent accounts (*-agent); you are $name. Use \`claude\`." ;; esac
+# As in the modulefile: without the policy Claude would start unsandboxed. The module
+# check does not follow PATH into an srun on a node that missed the last push.
+[ -r /etc/claude-code/managed-settings.json ] || die "Claude Code policy is missing on $(hostname); tell the Kaiju admin."
+
+# From passwd, not $HOME, so the caller's environment cannot point it at another file.
+home=$(getent passwd "$uid" | cut -d: -f6)
+[ -n "$home" ] || die "no home directory for $name"
+tok=$home/.config/kaiju-agent/oauth-token
+
+[ -L "$tok" ] && die "$tok is a symlink; it must be a plain file."
+[ -f "$tok" ] || die "no token at $tok. The member signs in once: run \`claude setup-token\` on a laptop, then save the token there (mode 600)."
+[ "$(stat -c %u "$tok")" = "$uid" ] || die "$tok is not owned by $name."
+[ "$(stat -c %a "$tok")" = 600 ] || die "$tok must be mode 600: chmod 600 $tok"
+
+token=$(head -n 1 "$tok") || die "cannot read $tok"
+[ -n "$token" ] || die "$tok is empty."
+
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+PATH=$CALLER_PATH
+CLAUDE_CODE_OAUTH_TOKEN=$token
+export CLAUDE_CODE_OAUTH_TOKEN
+exec /opt/cluster/software/claude-code/current/bin/claude "$@"

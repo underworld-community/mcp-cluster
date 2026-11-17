@@ -1,0 +1,5 @@
+{
+  "policyHelper": {
+    "path": "/etc/claude-code/policy-helper"
+  }
+}

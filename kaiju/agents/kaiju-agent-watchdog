@@ -1,0 +1,240 @@
+#!/bin/bash
+#
+# Cap the Slurm jobs of agent accounts (<member>-agent, uid 7000-7999).
+#
+#   kaiju-agent-watchdog             # enforce the caps; cron runs this every minute
+#   kaiju-agent-watchdog --dry-run   # show each agent's usage and what would be cancelled
+#
+# Install on the login node only, as root:
+#
+#   install -m 0755 -o root -g root kaiju-agent-watchdog /usr/local/sbin/
+#   /usr/local/sbin/kaiju-agent-watchdog --dry-run
+#   echo '* * * * * root /usr/local/sbin/kaiju-agent-watchdog' > /etc/cron.d/kaiju-agent-watchdog
+#   chmod 0644 /etc/cron.d/kaiju-agent-watchdog
+#
+# Slurm on Kaiju has no accounting, so per-user limits cannot be set in Slurm.
+# This is the stopgap until an agents partition with job_submit.lua exists; an
+# agent can stay over a cap for up to a minute.
+#
+# Optional /etc/kaiju-agents/watchdog.conf, one KEY=integer per line:
+#   MAX_JOBS=20         pending + running jobs per agent; each array task counts
+#   MAX_NODES=4         distinct nodes held by an agent's running jobs
+#   MAX_LOGIN_HOURS=0   kill an agent's login-node processes older than this; 0 = off
+#
+# Over MAX_JOBS: the newest pending jobs are cancelled first, then the newest
+# running. Over MAX_NODES: the newest running jobs, until the rest fit. Every
+# action goes to syslog (tag kaiju-agent-watchdog) and /var/log/kaiju-agent-watchdog.log.
+#
+# Only accounts named *-agent with a uid in 7000-7999 are touched. A uid that
+# getent also lists under a non-agent name is skipped, never capped.
+
+set -euo pipefail
+
+TAG=kaiju-agent-watchdog
+# Test-only prefix so stub runs never touch the real /etc, /var/log or /run.
+R=${KAIJU_AGENT_WATCHDOG_ROOT:-}
+CONF=$R/etc/kaiju-agents/watchdog.conf
+LOG=$R/var/log/kaiju-agent-watchdog.log
+LOCK=$R/run/kaiju-agent-watchdog.lock
+DOWN=$R/run/kaiju-agent-watchdog.squeue-down
+UID_MIN=7000
+UID_MAX=7999
+
+# cron's PATH is /usr/bin:/bin; Slurm may be installed elsewhere.
+PATH=$PATH:/usr/local/bin:/usr/sbin:/sbin:/opt/slurm/bin
+# An admin's own squeue settings would change what --dry-run sees and break the sort.
+for v in $(compgen -e); do
+    if [[ $v == SQUEUE_* ]]; then unset "$v"; fi
+done
+export SLURM_TIME_FORMAT=standard
+
+DRY=0
+case ${1:-} in
+    --dry-run) DRY=1 ;;
+    '') ;;
+    *) echo "usage: $0 [--dry-run]" >&2; exit 2 ;;
+esac
+
+log() {
+    if (( DRY )); then echo "dry-run, not done: $*"; return 0; fi
+    logger -t "$TAG" -- "$*" 2>/dev/null || true
+    printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null || true
+}
+
+MAX_JOBS=20
+MAX_NODES=4
+MAX_LOGIN_HOURS=0
+if [[ -r $CONF ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%%#*}
+        line=${line//[[:space:]]/}
+        [[ -z $line ]] && continue
+        if [[ $line =~ ^(MAX_JOBS|MAX_NODES|MAX_LOGIN_HOURS)=([0-9]{1,6})$ ]]; then
+            printf -v "${BASH_REMATCH[1]}" '%d' "$((10#${BASH_REMATCH[2]}))"
+        else
+            log "ignoring bad line in $CONF: $line"
+        fi
+    done <"$CONF"
+fi
+
+if (( ! DRY )); then
+    exec 9>>"$LOCK"
+    flock -n 9 || { log "previous run still going; skipped"; exit 0; }
+fi
+
+# Kaiju lists most accounts twice (NIS and files); a duplicate is harmless.
+declare -A NAME=()
+pw=$(timeout 30 getent passwd 2>/dev/null) || { log "getent passwd failed; nothing checked"; exit 0; }
+while read -r uid name; do
+    NAME[$uid]=$name
+done < <(awk -F: -v lo=$UID_MIN -v hi=$UID_MAX '
+    $3 !~ /^[0-9]+$/ { next }
+    $1 ~ /.-agent$/ && $3 + 0 >= lo && $3 + 0 <= hi { ok[$3] = $1; next }
+    { bad[$3] = 1 }
+    END { for (u in ok) if (!(u in bad)) print u, ok[u] }' <<<"$pw")
+(( ${#NAME[@]} )) || exit 0
+
+rc=0
+jobs=$(timeout 30 squeue -a -h -r -t PD,CF,R,S -o '%i|%U|%u|%t|%V|%N' 2>/dev/null) || rc=$?
+if (( rc )); then
+    # Logged once per outage, not every minute.
+    if (( DRY )) || [[ ! -e $DOWN ]]; then log "squeue failed (exit $rc); nothing checked"; fi
+    (( DRY )) || { : >>"$DOWN"; } 2>/dev/null || true
+    exit 0
+fi
+if (( ! DRY )) && [[ -e $DOWN ]]; then
+    rm -f "$DOWN"
+    log "squeue works again"
+fi
+
+# Slurm hostlist (n[1-3,5],n7) to one name per line. Kaiju's names have one bracket at most.
+expand_hosts() {
+    local list=$1 cur= c i parts=() p r a b w
+    local re='^([^[]*)\[([^]]*)\](.*)$' depth=0
+    for (( i = 0; i < ${#list}; i++ )); do
+        c=${list:i:1}
+        case $c in
+            '[') depth=1 ;;
+            ']') depth=0 ;;
+            ,) if (( ! depth )); then parts+=("$cur"); cur=; continue; fi ;;
+        esac
+        cur+=$c
+    done
+    parts+=("$cur")
+    for p in "${parts[@]}"; do
+        [[ -n $p ]] || continue
+        if [[ $p =~ $re ]]; then
+            local pre=${BASH_REMATCH[1]} body=${BASH_REMATCH[2]} suf=${BASH_REMATCH[3]} rs=()
+            IFS=, read -ra rs <<<"$body"
+            for r in "${rs[@]}"; do
+                if [[ $r =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                    a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]} w=${#BASH_REMATCH[1]}
+                    for (( i = 10#$a; i <= 10#$b; i++ )); do printf '%s%0*d%s\n' "$pre" "$w" "$i" "$suf"; done
+                else
+                    printf '%s%s%s\n' "$pre" "$r" "$suf"
+                fi
+            done
+        else
+            printf '%s\n' "$p"
+        fi
+    done
+}
+
+count_nodes() {
+    local l
+    for l in "$@"; do expand_hosts "$l"; done | sort -u | grep -c . || true
+}
+
+# Rows are "kind|submit|base|index|cancel-id|nodes", kept per agent uid.
+declare -A ROWS=()
+while IFS='|' read -r id juid _ st submit nodes; do
+    [[ $juid =~ ^[0-9]+$ && -n ${NAME[$juid]+x} ]] || continue
+    [[ $id =~ ^([0-9]+)(([_+])([0-9]+))?$ ]] || continue
+    base=${BASH_REMATCH[1]} sep=${BASH_REMATCH[3]} idx=${BASH_REMATCH[4]:-0}
+    # A het-job component cannot be cancelled on its own; cancel the whole job.
+    cid=$id
+    [[ $sep == + ]] && cid=$base
+    case $st in
+        PD) kind=P ;;
+        R|CF|S) kind=R ;;
+        *) continue ;;
+    esac
+    ROWS[$juid]+="$kind|$submit|$base|$idx|$cid|$nodes"$'\n'
+done <<<"$jobs"
+
+for uid in $(printf '%s\n' "${!NAME[@]}" | sort -n); do
+    agent=${NAME[$uid]}
+    pend=() run=() runnodes=()
+    while IFS='|' read -r kind _ _ _ cid nodes; do
+        [[ -n $kind ]] || continue
+        if [[ $kind == P ]]; then
+            pend+=("$cid")
+        else
+            run+=("$cid")
+            runnodes+=("$nodes")
+        fi
+    done < <(printf '%s' "${ROWS[$uid]:-}" | sort -t'|' -k2,2r -k3,3nr -k4,4nr)
+
+    total=$(( ${#pend[@]} + ${#run[@]} ))
+    if (( DRY )); then
+        echo "$agent (uid $uid): ${#pend[@]} pending, ${#run[@]} running on $(count_nodes "${runnodes[@]}") nodes;" \
+             "caps $MAX_JOBS jobs, $MAX_NODES nodes"
+    fi
+
+    victims=()
+    declare -A seen=()
+    excess=$(( total - MAX_JOBS ))
+    for cid in "${pend[@]}"; do
+        (( excess > 0 )) || break
+        excess=$(( excess - 1 ))
+        [[ -n ${seen[$cid]+x} ]] && continue
+        seen[$cid]=1
+        victims+=("$cid")
+        log "cancel $cid ($agent, pending; $total jobs > MAX_JOBS=$MAX_JOBS)"
+    done
+    k=0
+    while (( excess > 0 && k < ${#run[@]} )); do
+        cid=${run[k]}
+        excess=$(( excess - 1 ))
+        k=$(( k + 1 ))
+        [[ -n ${seen[$cid]+x} ]] && continue
+        seen[$cid]=1
+        victims+=("$cid")
+        log "cancel $cid ($agent, running; $total jobs > MAX_JOBS=$MAX_JOBS)"
+    done
+    while (( k < ${#run[@]} )); do
+        n=$(count_nodes "${runnodes[@]:k}")
+        (( n > MAX_NODES )) || break
+        cid=${run[k]}
+        k=$(( k + 1 ))
+        [[ -n ${seen[$cid]+x} ]] && continue
+        seen[$cid]=1
+        victims+=("$cid")
+        log "cancel $cid ($agent, running; $n nodes > MAX_NODES=$MAX_NODES)"
+    done
+    unset seen
+
+    # --user makes scancel refuse any id that is not this agent's, whatever went wrong above.
+    if (( ! DRY )); then
+        for (( s = 0; s < ${#victims[@]}; s += 100 )); do
+            timeout 30 scancel --user="$agent" "${victims[@]:s:100}" 2>/dev/null \
+                || log "scancel failed (exit $?) for $agent: ${victims[*]:s:100}"
+        done
+    fi
+
+    if (( MAX_LOGIN_HOURS > 0 )); then
+        limit=$(( MAX_LOGIN_HOURS * 3600 ))
+        while read -r pid age; do
+            [[ $pid =~ ^[0-9]+$ && $age =~ ^[0-9]+$ ]] || continue
+            (( age > limit )) || continue
+            # TERM first; anything still there five minutes later gets KILL.
+            sig=TERM
+            (( age > limit + 300 )) && sig=KILL
+            # Re-check the owner so a pid reused since ps ran is left alone.
+            [[ $(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ') == "$uid" ]] || continue
+            log "kill -$sig $pid ($agent, login-node process ${age}s old > MAX_LOGIN_HOURS=$MAX_LOGIN_HOURS)"
+            (( DRY )) || kill -s "$sig" "$pid" 2>/dev/null || true
+        done < <(ps -u "$uid" -o pid=,etimes= 2>/dev/null)
+    fi
+done
+exit 0

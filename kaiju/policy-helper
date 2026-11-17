@@ -1,0 +1,77 @@
+#!/bin/sh -p
+# Kaiju policy helper, named by policyHelper in /etc/claude-code/managed-settings.json.
+# Claude Code runs it as the launching user, with that user's environment, and refuses
+# to start if it exits non-zero, so every unexpected state exits 1 rather than falling
+# back to a looser policy.
+
+# -p: bash-as-sh then imports no functions from the environment and ignores BASH_ENV/ENV.
+# The class comes from the kernel's uid and gid list (id -u / id -G need no name lookup),
+# never from $USER, $HOME or anything else the caller's environment sets.
+PATH=/usr/bin:/bin
+export PATH
+
+CONF=/etc/claude-code/policy-helper.conf
+POLICIES=/etc/claude-code/policies
+
+die() {
+    printf 'Kaiju Claude Code policy: %s\n' "$*" >&2
+    exit 1
+}
+
+[ -r "$CONF" ] || die "$CONF is missing; tell the Kaiju admin."
+. "$CONF"
+for v in "$AGENT_GID" "$AGENT_UID_MIN" "$AGENT_UID_MAX"; do
+    case $v in ''|*[!0-9]*) die "$CONF is incomplete; tell the Kaiju admin." ;; esac
+done
+case $HUMAN_GIDS in ''|*[!0-9\ ]*) die "$CONF has no valid HUMAN_GIDS; tell the Kaiju admin." ;; esac
+
+uid=$(id -u) || die "cannot read uid"
+gids=" $(id -G) " || die "cannot read groups"
+name=$(id -un) || die "cannot resolve the name of uid $uid"
+
+member() {
+    case $gids in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+[ "$uid" -eq 0 ] && die "Claude Code does not run as root on Kaiju."
+case $name in *-adm) die "Claude Code does not run from admin accounts; use your everyday or agent account." ;; esac
+
+# Half an agent (marker group or -agent name without the rest) is a broken account, and the
+# human policy would let it grant itself permissions through project settings: refuse.
+agentish=0
+member "$AGENT_GID" && agentish=1
+case $name in *-agent) agentish=1 ;; esac
+
+if [ "$agentish" = 1 ]; then
+    member "$AGENT_GID" || die "$name is not in group $AGENT_GID; tell the Kaiju admin."
+    case $name in *-agent) ;; *) die "$name is in the agent group but not named *-agent; tell the Kaiju admin." ;; esac
+    [ "$uid" -ge "$AGENT_UID_MIN" ] && [ "$uid" -le "$AGENT_UID_MAX" ] \
+        || die "agent $name has uid $uid, outside $AGENT_UID_MIN-$AGENT_UID_MAX; tell the Kaiju admin."
+    for g in $HUMAN_GIDS; do
+        member "$g" && die "agent account $name is in group $g; tell the Kaiju admin."
+    done
+    # Name and home are pasted into JSON by sed, so both are held to a plain alphabet.
+    case $name in *[!a-z0-9._-]*) die "unsafe account name '$name'" ;; esac
+    home=$(getent passwd "$uid" | cut -d: -f6)
+    [ "$home" = "/home/$name" ] || die "agent $name has home '$home', expected /home/$name; tell the Kaiju admin."
+
+    # The agent's unprompted jobs and apptainer calls can rewrite anything it owns, so its
+    # startup files are only safe while it owns neither them nor the directories holding them.
+    for p in "$home" "$home/.claude" "$home/.config" "$home/.bashrc" "$home/.bash_profile" \
+             "$home/.profile" "$home/.bash_logout" "$home/.gitconfig" \
+             "$home/.claude/settings.json" "$home/.claude/CLAUDE.md"; do
+        [ -e "$p" ] || die "$p is missing; tell the Kaiju admin."
+        [ -O "$p" ] && die "$p is owned by $name but must be root-owned; tell the Kaiju admin."
+    done
+
+    # The installer put CLAUDE-agent.md in as claudeMd: Claude Code reads only managedSettings from the output.
+    policy=$(sed -e "s|@HOME@|$home|g" -e "s|@AGENT@|$name|g" "$POLICIES/agent.json") \
+        || die "cannot read the agent policy"
+    [ -n "$policy" ] || die "empty agent policy"
+    printf '{"managedSettings": %s}\n' "$policy"
+else
+    policy=$(cat "$POLICIES/human.json") || die "cannot read the user policy"
+    [ -n "$policy" ] || die "empty user policy"
+    printf '{"managedSettings": %s}\n' "$policy"
+fi

@@ -1,0 +1,190 @@
+{
+  "env": {
+    "DISABLE_UPDATES": "1",
+    "DISABLE_FEEDBACK_COMMAND": "1",
+    "BASH_ENV": "",
+    "ENV": "",
+    "APPTAINER_CACHEDIR": "@HOME@/.cache/apptainer",
+    "APPTAINER_TMPDIR": "@HOME@/work/.tmp",
+    "PIP_CACHE_DIR": "@HOME@/.cache/pip",
+    "CLAUDE_CODE_DISABLE_CRON": "1"
+  },
+  "companyAnnouncements": [
+    "Kaiju agent account: sbatch, srun, scancel and apptainer run without asking, as this account. Never run this account's code, jobs or repositories as yourself."
+  ],
+  "allowManagedHooksOnly": true,
+  "disableAllHooks": true,
+  "allowManagedPermissionRulesOnly": true,
+  "allowManagedMcpServersOnly": true,
+  "allowedMcpServers": [],
+  "disableClaudeAiConnectors": true,
+  "disableRemoteControl": true,
+  "autoMemoryEnabled": false,
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "disableBypassPermissionsMode": "disable",
+    "additionalDirectories": [
+      "@HOME@/work"
+    ],
+    "allow": [
+      "Bash(squeue *)",
+      "Bash(sinfo *)",
+      "Bash(scontrol show *)",
+      "Bash(sbatch *)",
+      "Bash(scancel *)",
+      "Bash(srun *)",
+      "Bash(apptainer *)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:docs.python.org)",
+      "WebFetch(domain:petsc.org)"
+    ],
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.netrc)",
+      "Read(~/.git-credentials)",
+      "Read(~/.pypirc)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.docker/**)",
+      "Read(~/.apptainer/**)",
+      "Read(~/.claude/.credentials.json)",
+      "Read(~/.config/kaiju-agent/**)",
+      "Edit(~/.ssh/**)",
+      "Edit(~/.gnupg/**)",
+      "Edit(~/.bashrc)",
+      "Edit(~/.bash_profile)",
+      "Edit(~/.bash_login)",
+      "Edit(~/.bash_logout)",
+      "Edit(~/.bash_aliases)",
+      "Edit(~/.bashrc.d/**)",
+      "Edit(~/.profile)",
+      "Edit(~/.zshrc)",
+      "Edit(~/.zprofile)",
+      "Edit(~/.zshenv)",
+      "Edit(~/.local/**)",
+      "Edit(~/bin/**)",
+      "Edit(~/.gitconfig)",
+      "Edit(~/.config/**)",
+      "Edit(~/.tmux.conf)",
+      "Edit(~/.modulerc)",
+      "Edit(~/.apptainer/**)",
+      "Edit(~/.claude.json)",
+      "Edit(~/.claude/settings.json)",
+      "Edit(~/.claude/CLAUDE.md)",
+      "Edit(~/.claude/agents/**)",
+      "Edit(~/.claude/skills/**)",
+      "Edit(~/.claude/commands/**)",
+      "Edit(//opt/cluster/**)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "excludedCommands": [
+      "squeue *",
+      "sinfo *",
+      "scontrol show *",
+      "sbatch *",
+      "scancel *",
+      "srun *",
+      "apptainer *"
+    ],
+    "network": {
+      "allowManagedDomainsOnly": true,
+      "allowedDomains": [
+        "pypi.org",
+        "files.pythonhosted.org",
+        "github.com",
+        "api.github.com",
+        "codeload.github.com",
+        "objects.githubusercontent.com",
+        "raw.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "ghcr.io",
+        "pkg-containers.githubusercontent.com",
+        "conda.anaconda.org",
+        "prefix.dev",
+        "repo.prefix.dev",
+        "conda-mapping.prefix.dev"
+      ]
+    },
+    "filesystem": {
+      "allowManagedReadPathsOnly": true,
+      "allowWrite": [
+        "~/.cache",
+        "/home/agent-share/@AGENT@/outbox"
+      ],
+      "denyRead": [
+        "~/.ssh",
+        "~/.gnupg",
+        "~/.aws",
+        "~/.netrc",
+        "~/.git-credentials",
+        "~/.pypirc",
+        "~/.config/gh",
+        "~/.docker",
+        "~/.apptainer",
+        "~/.claude/.credentials.json",
+        "~/.config/kaiju-agent"
+      ],
+      "denyWrite": [
+        "~/.ssh",
+        "~/.gnupg",
+        "~/.bashrc",
+        "~/.bash_profile",
+        "~/.bash_login",
+        "~/.bash_logout",
+        "~/.bash_aliases",
+        "~/.bashrc.d",
+        "~/.profile",
+        "~/.zshrc",
+        "~/.zprofile",
+        "~/.zshenv",
+        "~/.local",
+        "~/bin",
+        "~/.gitconfig",
+        "~/.config",
+        "~/.tmux.conf",
+        "~/.modulerc",
+        "~/.apptainer",
+        "~/.claude/settings.json",
+        "~/.claude/CLAUDE.md",
+        "~/.claude/agents",
+        "~/.claude/skills",
+        "~/.claude/commands",
+        "~/.claude/plugins",
+        "~/.claude.json",
+        "/opt/cluster"
+      ]
+    },
+    "credentials": {
+      "envVars": [
+        {
+          "name": "ANTHROPIC_API_KEY",
+          "mode": "deny"
+        },
+        {
+          "name": "ANTHROPIC_AUTH_TOKEN",
+          "mode": "deny"
+        },
+        {
+          "name": "CLAUDE_CODE_OAUTH_TOKEN",
+          "mode": "deny"
+        },
+        {
+          "name": "GITHUB_TOKEN",
+          "mode": "deny"
+        },
+        {
+          "name": "GH_TOKEN",
+          "mode": "deny"
+        }
+      ]
+    }
+  }
+}

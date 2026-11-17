@@ -1,0 +1,293 @@
+#!/bin/bash
+#
+# Keep agent accounts (uid 7000-7999) off the cluster's internal network, on the login node.
+# Optional: the canary spec defers egress filtering, so the admin decides whether to apply it.
+#
+#   sudo ./kaiju-agent-netguard apply              # add the rules, or refresh them (rerun is safe)
+#   sudo ./kaiju-agent-netguard test jdoe-agent    # run the checks below as the agent
+#   sudo ./kaiju-agent-netguard status             # rules with counters, NIS port drift, recent rejects
+#   sudo ./kaiju-agent-netguard remove             # rollback: deletes everything this script added
+#   ./kaiju-agent-netguard -n apply|remove         # print the commands only; no root needed
+#
+# Agent processes on the login node can still reach:
+#   - Slurm: SlurmctldPort and SlurmdPort (from `scontrol show config`, else 6817, 6818) at any address.
+#     srun also listens for connections from slurmstepd on the nodes; those are inbound, and srun's
+#     replies are ESTABLISHED, so srun works.
+#   - DNS (53) anywhere, and NIS: rpcbind 111 plus the ypbind/ypserv ports registered at apply time.
+#     NSS runs inside the agent's own processes, so without these `id`, `ls -l` and squeue lose names.
+#     munge, nscd and sssd use unix sockets, which this does not touch.
+#   - this node's own addresses (from `ip addr` at apply time) on the ephemeral port range
+#     only: Claude's sandbox reaches its own proxy with `socat ... TCP:localhost:<random port>`, and MPI
+#     and Jupyter kernels use random loopback ports. Fixed-port local services (NFS, ssh, other users'
+#     Jupyter on 8888, rpcbind unless NIS needs it) are refused.
+#   - the internet, HTTPS included. Filtering egress by domain (a proxy) is deferred.
+# Refused, and logged with a rate limit (`journalctl -k | grep kaiju-agents-reject`):
+#   - tcp/22 anywhere: no password guessing against human accounts, no ssh out (git over https only).
+#   - every other new connection to private and link-local nets (10/8, 172.16/12, 192.168/16,
+#     169.254/16, fe80::/10, fc00::/7): NFS 2049 (AUTH_SYS lets a client claim any uid), BMCs, nodes.
+#
+# The rules match the socket owner, so they cover everything the agent uid runs: Claude, its sandbox,
+# other harnesses, apptainer (user namespaces keep the host uid). Jobs on compute nodes are NOT
+# covered. Connections open before `apply` stay up until closed.
+#
+# With firewalld running, the rules go in as --direct rules, runtime and --permanent, so they survive
+# a reboot. Without it they are plain iptables rules and are lost at reboot: rerun `apply` after boot.
+# Switching between the two: `remove` first. A firewalld re-apply leaves agents unfiltered for the
+# seconds it takes to re-add the rules one by one.
+# ypserv and ypbind take new ports when restarted unless pinned with -p: `status` flags the drift;
+# rerun `apply` after a restart or reboot, or pin the ports.
+#
+# Tests (`test <agent>` runs them; by hand: cd / && sudo -u jdoe-agent setsid -w bash -c '...' </dev/null)
+#   squeue; sbatch --test-only --wrap=hostname; srun -n1 hostname     work
+#   getent passwd jdoe;  curl -sI https://pypi.org                     work
+#   ssh n1; nc -z <nfs server> 2049; ssh localhost                     Connection refused
+#   claude-agent, sandboxed `curl -sI https://pypi.org`, host approved HTTP 200 (sandbox proxy path)
+#
+# Rollback without this script:
+#   iptables -D OUTPUT -m owner --uid-owner 7000-7999 -j KAIJU_AGENTS; same with ip6tables
+#   firewalld: firewall-cmd [--permanent] --direct --remove-rule ipv4 filter OUTPUT 0 \
+#                  -m owner --uid-owner 7000-7999 -j KAIJU_AGENTS; same with ipv6
+
+set -euo pipefail
+
+UIDS=7000-7999
+CHAIN=KAIJU_AGENTS
+REJ=KAIJU_AGENTS_REJ
+NETS4="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16"
+NETS6="fe80::/10 fc00::/7"
+JUMP=(-m owner --uid-owner "$UIDS" -j "$CHAIN")
+PY=/usr/libexec/platform-python
+NSSWITCH=${NSSWITCH:-/etc/nsswitch.conf}
+
+DRY=0
+if [ "${1:-}" = -n ]; then DRY=1; shift; fi
+
+die() { echo "kaiju-agent-netguard: $*" >&2; exit 1; }
+run() { if [ "$DRY" = 1 ]; then echo "$*"; else "$@"; fi; }
+fwc() { run firewall-cmd -q "$@"; }
+firewalld_on() { systemctl is-active -q firewalld 2>/dev/null; }
+
+slurm_port() {
+    local p
+    p=$(scontrol show config 2>/dev/null | awk -F= -v k="$1" '$1 ~ "^"k" *$" {gsub(/ /, "", $2); print $2}')
+    p=${p//-/:}
+    [[ $p =~ ^[0-9]+(:[0-9]+)?$ ]] && echo "$p" || echo "$2"
+}
+
+# Comma list of the ports program $2 has registered over $3 at host $1.
+rpc_ports() {
+    { rpcinfo -p "$1" 2>/dev/null || true; } | awk -v p="$2" -v t="$3" '$1 == p && $3 == t {print $4}' | sort -un | paste -sd, -
+}
+
+is_local() {
+    local mine
+    mine=$(ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1) || true
+    [[ $1 == 127.* ]] || grep -qxF "$1" <<<"$mine"
+}
+
+# NIS accept rules (IPv4), one per line. NIS ports are not fixed, so they are read from rpcbind now.
+nis_rules() {
+    grep -Eq '^(passwd|group):.*[[:space:]]nis([[:space:]]|$)' "$NSSWITCH" 2>/dev/null || return 0
+    local srv addrs a t bind serv srv_local=0
+    srv=$(ypwhich 2>/dev/null) || die "nsswitch.conf uses NIS but ypwhich fails: fix ypbind, then rerun"
+    addrs=$(getent ahostsv4 "$srv" | awk '{print $1}' | sort -u) || true
+    [ -n "$addrs" ] || die "cannot resolve NIS server $srv"
+    for a in $addrs; do is_local "$a" && srv_local=1; done
+    [ -n "$(rpc_ports "$srv" 100004 tcp)$(rpc_ports "$srv" 100004 udp)" ] \
+        || die "no ypserv ports from \`rpcinfo -p $srv\`; agents would lose NIS lookups"
+    for t in tcp udp; do
+        bind=$(rpc_ports localhost 100007 "$t")
+        serv=$(rpc_ports "$srv" 100004 "$t")
+        if [ "$srv_local" = 1 ]; then
+            echo "-m addrtype --dst-type LOCAL -p $t -m multiport --dports 111${bind:+,$bind}${serv:+,$serv} -j ACCEPT"
+        else
+            echo "-m addrtype --dst-type LOCAL -p $t -m multiport --dports 111${bind:+,$bind} -j ACCEPT"
+            for a in $addrs; do
+                echo "-d $a -p $t -m multiport --dports 111${serv:+,$serv} -j ACCEPT"
+            done
+        fi
+    done
+}
+
+# Every rule, as "<chain> <args>", in order. $1 = 4 or 6.
+rules() {
+    local v=$1 net nets r
+    [ "$v" = 4 ] && nets=$NETS4 || nets=$NETS6
+    echo "$CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+    echo "$CHAIN -p tcp -m multiport --dports $SLURM -j ACCEPT"
+    echo "$CHAIN -p udp --dport 53 -j ACCEPT"
+    echo "$CHAIN -p tcp --dport 53 -j ACCEPT"
+    if [ "$v" = 4 ]; then for r in "${NIS[@]}"; do echo "$CHAIN $r"; done; fi
+    echo "$CHAIN -p tcp --dport 22 -j $REJ"
+    echo "$CHAIN -m addrtype --dst-type LOCAL -p tcp --dport $EPHEM -j ACCEPT"
+    echo "$CHAIN -m addrtype --dst-type LOCAL -p udp --dport $EPHEM -j ACCEPT"
+    echo "$CHAIN -m addrtype --dst-type LOCAL -j $REJ"
+    for net in $nets; do echo "$CHAIN -d $net -j $REJ"; done
+    echo "$REJ -m limit --limit 6/min --limit-burst 10 -j LOG --log-prefix kaiju-agents-reject: --log-uid"
+    echo "$REJ -p tcp -j REJECT --reject-with tcp-reset"
+    echo "$REJ -j REJECT"
+}
+
+detect() {
+    local lo hi out
+    SLURM="$(slurm_port SlurmctldPort 6817),$(slurm_port SlurmdPort 6818)"
+    read -r lo hi < <(sysctl -n net.ipv4.ip_local_port_range)
+    [[ $lo =~ ^[0-9]+$ && $hi =~ ^[0-9]+$ ]] || die "cannot read net.ipv4.ip_local_port_range"
+    EPHEM=$lo:$hi
+    out=$(nis_rules)
+    NIS=()
+    [ -z "$out" ] || mapfile -t NIS <<<"$out"
+}
+
+# One restore per family: it either loads every rule or changes nothing.
+restore_text() {
+    echo '*filter'; echo ":$CHAIN - [0:0]"; echo ":$REJ - [0:0]"
+    rules "$1" | sed 's/^/-A /'
+    echo COMMIT
+}
+
+apply_iptables() {
+    local v ipt want got
+    for v in 4 6; do
+        [ "$v" = 4 ] && ipt=iptables || ipt=ip6tables
+        if [ "$DRY" = 1 ]; then
+            echo "$ipt-restore --noflush <<'EOF'"; restore_text "$v"; echo EOF
+            echo "$ipt -C OUTPUT ${JUMP[*]} || $ipt -I OUTPUT 1 ${JUMP[*]}"
+            continue
+        fi
+        restore_text "$v" | "$ipt-restore" --noflush || die "$ipt-restore failed; previous rules, if any, unchanged"
+        want=$(rules "$v" | grep -c "^$CHAIN ")
+        got=$("$ipt" -S "$CHAIN" | grep -c '^-A ') || true
+        [ "$want" = "$got" ] || die "$ipt chain $CHAIN has $got rules, expected $want: run remove, then apply"
+        "$ipt" -C OUTPUT "${JUMP[@]}" 2>/dev/null || "$ipt" -I OUTPUT 1 "${JUMP[@]}"
+    done
+    [ "$DRY" = 1 ] || echo "applied: plain iptables/ip6tables rules; NOT persistent: rerun \`$0 apply\` after every reboot"
+}
+
+apply_firewalld() {
+    local v fam p chain args i
+    [ "$DRY" = 1 ] || ! iptables -C OUTPUT "${JUMP[@]}" 2>/dev/null \
+        || die "plain iptables rules from an apply without firewalld are loaded: run remove first"
+    for v in 4 6; do
+        fam=ipv$v
+        # Runtime first so the rules take effect now, then --permanent; no reload, which
+        # would drop other runtime-only firewall changes.
+        for p in "" --permanent; do
+            fwc $p --direct --add-chain "$fam" filter "$REJ"
+            fwc $p --direct --add-chain "$fam" filter "$CHAIN"
+            fwc $p --direct --remove-rules "$fam" filter "$CHAIN"
+            fwc $p --direct --remove-rules "$fam" filter "$REJ"
+            # firewalld orders by priority only; equal priorities have no fixed order.
+            i=0
+            while read -r chain args; do
+                read -ra args <<<"$args"
+                fwc $p --direct --add-rule "$fam" filter "$chain" "$i" "${args[@]}"
+                i=$((i + 1))
+            done < <(rules "$v")
+            fwc $p --direct --add-rule "$fam" filter OUTPUT 0 "${JUMP[@]}"
+        done
+    done
+    [ "$DRY" = 1 ] || echo "applied: firewalld --direct rules, runtime and permanent"
+}
+
+remove_all() {
+    local fam p ipt c
+    if firewalld_on; then
+        for fam in ipv4 ipv6; do
+            for p in "" --permanent; do
+                fwc $p --direct --remove-rule "$fam" filter OUTPUT 0 "${JUMP[@]}" || true
+                fwc $p --direct --remove-rules "$fam" filter "$CHAIN" || true
+                fwc $p --direct --remove-rules "$fam" filter "$REJ" || true
+                fwc $p --direct --remove-chain "$fam" filter "$CHAIN" || true
+                fwc $p --direct --remove-chain "$fam" filter "$REJ" || true
+            done
+        done
+    fi
+    for ipt in iptables ip6tables; do
+        if [ "$DRY" = 1 ] || "$ipt" -C OUTPUT "${JUMP[@]}" 2>/dev/null; then
+            run "$ipt" -D OUTPUT "${JUMP[@]}"
+        fi
+        # Under firewalld, firewall-cmd removed the chains above; touching them here would desync it.
+        firewalld_on && continue
+        for c in "$CHAIN" "$REJ"; do
+            if [ "$DRY" = 1 ] || "$ipt" -S "$c" >/dev/null 2>&1; then run "$ipt" -F "$c"; fi
+        done
+        for c in "$CHAIN" "$REJ"; do
+            if [ "$DRY" = 1 ] || "$ipt" -S "$c" >/dev/null 2>&1; then run "$ipt" -X "$c"; fi
+        done
+    done
+    [ "$DRY" = 1 ] || echo "removed: agents are unfiltered"
+}
+
+status() {
+    local ipt now loaded
+    firewalld_on && echo "backend: firewalld --direct" || echo "backend: plain iptables (not persistent)"
+    for ipt in iptables ip6tables; do
+        # grep without -q reads to the end, so pipefail never sees iptables die of SIGPIPE.
+        if "$ipt" -S 2>/dev/null | grep -- "-j $CHAIN\$" >/dev/null; then echo "$ipt: ACTIVE"; else echo "$ipt: not active"; fi
+        "$ipt" -L "$CHAIN" -nv --line-numbers 2>/dev/null || true
+        "$ipt" -L "$REJ" -nv 2>/dev/null || true
+    done
+    if firewalld_on; then
+        echo "firewalld permanent direct rules: $(firewall-cmd --permanent --direct --get-all-rules | grep -c "$CHAIN")"
+    fi
+    now=$(printf '%s\n' "${NIS[@]}" | grep -o -- '--dports [0-9,]*' | cut -d' ' -f2 | sort -u | paste -sd' ' -) || true
+    loaded=$(iptables -S "$CHAIN" 2>/dev/null | grep -o -- '--dports 111[0-9,]*' | cut -d' ' -f2 | sort -u | paste -sd' ' -) || true
+    if [ "$now" != "$loaded" ]; then
+        echo "NIS PORTS CHANGED: rules have [$loaded], rpcbind now has [$now]: rerun apply" >&2
+    fi
+    echo "recent rejects:"
+    journalctl -k --since -24h --no-pager 2>/dev/null | grep kaiju-agents-reject | tail -5 || true
+}
+
+test_agent() {
+    local agent=${1:-} member node nfs n_fail=0
+    [[ $agent == ?*-agent ]] || die "usage: $0 test <member>-agent"
+    id "$agent" >/dev/null || die "no such account $agent"
+    member=${agent%-agent}
+    node=$(sinfo -h -N -r -o %N 2>/dev/null | head -1) || true
+    node=${node:-n1}
+    nfs=$(findmnt -no SOURCE -T /home 2>/dev/null | grep : | cut -d: -f1 || true)
+    nfs=${nfs:-$node}
+
+    check() {
+        local want=$1 what=$2 out rc=0
+        shift 2
+        out=$(cd / && timeout 120 sudo -u "$agent" setsid -w env PATH="$PATH" "$@" </dev/null 2>&1) || rc=$?
+        if { [ "$want" = ok ] && [ "$rc" = 0 ]; } || { [ "$want" = refused ] && [ "$rc" != 0 ] && [[ $out == *refused* ]]; }; then
+            printf 'PASS  %s\n' "$what"
+        else
+            printf 'FAIL  %-40s want %s, got rc=%s: %s\n' "$what" "$want" "$rc" "$(head -1 <<<"$out")"
+            n_fail=$((n_fail + 1))
+        fi
+    }
+    check ok      "squeue"                    squeue -h -u "$agent"
+    check ok      "sbatch --test-only"        sbatch --test-only -t 1 --wrap=hostname
+    check ok      "srun -n1 hostname"         srun -n1 -t 1 --immediate=60 hostname
+    check ok      "getent passwd $member"     getent passwd "$member"
+    check ok      "curl https://pypi.org"     curl -sSfI -m 20 -o /dev/null https://pypi.org
+    check ok      "loopback, random port"     "$PY" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(1); socket.create_connection(s.getsockname(), 5)'
+    check refused "ssh $node (tcp 22)"        bash -c "</dev/tcp/$node/22"
+    check refused "ssh localhost (tcp 22)"    bash -c '</dev/tcp/127.0.0.1/22'
+    check refused "nfs $nfs:2049"             bash -c "</dev/tcp/$nfs/2049"
+    echo "log lines in the last 5 min: $(journalctl -k --since -5min --no-pager 2>/dev/null | grep -c kaiju-agents-reject || true)"
+    [ "$n_fail" = 0 ] || die "$n_fail check(s) failed"
+}
+
+ACTION=${1:-}
+case $ACTION in
+    apply|remove|status|test) ;;
+    *) sed -n '3,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+esac
+[ "$DRY" = 1 ] || [ "$(id -u)" = 0 ] || die "run as root (sudo), or with -n to print the commands"
+[ "$DRY" = 0 ] || [ "$ACTION" = apply ] || [ "$ACTION" = remove ] || die "-n works with apply and remove"
+
+case $ACTION in
+    apply)
+        detect
+        echo "# slurm ports $SLURM; local ephemeral $EPHEM; NIS rules ${#NIS[@]}" >&2
+        if firewalld_on; then apply_firewalld; else apply_iptables; fi ;;
+    remove) remove_all ;;
+    status) detect; status ;;
+    test)   test_agent "${2:-}" ;;
+esac
