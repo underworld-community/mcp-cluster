@@ -2,6 +2,7 @@
 
 Claude Code and the group's clusters. Members: start at [Quick start](#quick-start). Admins and
 maintainers: [ADMIN.md](ADMIN.md). Claude on Kaiju itself: [kaiju/README.md](kaiju/README.md).
+Licence: LGPL-3.0 ([COPYING.LESSER](COPYING.LESSER), with the GPL it builds on in [COPYING](COPYING)).
 
 ## In brief
 
@@ -12,7 +13,8 @@ maintainers: [ADMIN.md](ADMIN.md). Claude on Kaiju itself: [kaiju/README.md](kai
   ([Codex CLI](#codex-cli-read-only)).
 - **Claude on Kaiju** ([kaiju/](kaiju/)): Claude Code on the Kaiju login node, plus agent accounts
   (`<you>-agent`) that work unattended.
-- **Status:** not rolled out; the [live tests](ADMIN.md#open-live-tests) are next.
+- **Status:** on trial. Gadi and the first Kaiju agent account pass; the remaining
+  [live tests](ADMIN.md#open-live-tests) are open.
 
 ## Quick start
 
@@ -49,7 +51,7 @@ later, and `xcode-select -p` prints a path (if not, `xcode-select --install`).
    paths filled in.
 
    ```bash
-   git clone https://github.com/jcgraciosa/mcp-cluster.git
+   git clone https://github.com/underworld-community/mcp-cluster.git
    cd mcp-cluster/laptop && /usr/bin/python3 -I hpc_mcp.py install
    ```
 3. **Config:** edit `~/.config/uw3-hpc/config.json` ([fields](#set-up-once)):

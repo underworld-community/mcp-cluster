@@ -287,6 +287,8 @@ Email help@nci.org.au and help@pawsey.org.au:
 README.md                    members' guide: the one to read
 ADMIN.md                     this file: admin and maintainers
 .gitignore                   .DS_Store, __pycache__, Claude Code's .claude/.cc-writes
+COPYING                      the GPL-3.0 text, which the LGPL builds on
+COPYING.LESSER               the licence: LGPL-3.0
 laptop/                      the laptop link: Python 3.9 standard library only, macOS and Linux
   .gitignore                 __pycache__, the live kit's results
   hpc_mcp.py                 entry point: serve, serve-codex, install, doctor, doctor-codex, reset, selftest
